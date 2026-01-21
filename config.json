@@ -7,28 +7,89 @@
     "output_dir": "results"
   },
   "preprocessing": {
-    "resampling_method": "cubic_spline",
+    "resampling_method": ["pchip", "akima", "linear", "nearest", "cubic_spline"],
     "steps": [
-      {
-        "method": "baseline_correction",
-        "params": {"degree": 3},
-        "name": "基线校正"
-      },
+      
+    
       {
         "method": "smoothing",
         "params": {"method": "savgol", "window_length": 5},
         "name": "SG平滑"
-      },
-      {
-        "method": "snv_normalization",
-        "params": {},
-        "name": "SNV归一化"
       }
+      
     ]
   },
   "model": {
     "max_components": 15,
-    "test_size": 0.2,
-    "random_state": 42
+    "parsimony_threshold": 0.01,
+    "scale": false,
+    "test_size": 0.2,      
+    "random_state": 42,    
+    "manual_split": {
+      "enabled": true,
+      "train_samples": [],
+      "test_samples": [9,13,17,21,25,29,33,37,41,45]
+    }
+  },
+  "_preprocessing_templates_for_copy_paste": {
+    "baseline_correction": {
+      "method": "baseline_correction",
+      "params": { "degree": 3 },
+      "name": "多项式基线校正"
+    },
+    "asls_baseline_correction": {
+      "method": "asls_baseline_correction",
+      "params": { "lam": 100000, "p": 0.001, "niter": 10 },
+      "name": "AsLS基线校正"
+    },
+    "smoothing": {
+      "method": "smoothing",
+      "params": { "method": "savgol", "window_length": 5, "polyorder": 3 },
+      "name": "SG平滑"
+    },
+    "snv_normalization": {
+      "method": "snv_normalization",
+      "params": {},
+      "name": "SNV归一化"
+    },
+    "min_max_normalization": {
+      "method": "min_max_normalization",
+      "params": {},
+      "name": "Min-Max归一化"
+    },
+    "l2_normalization": {
+      "method": "l2_normalization",
+      "params": {},
+      "name": "L2范数归一化"
+    },
+    "derivative_spectrum": {
+      "method": "derivative_spectrum",
+      "params": { "order": 1 },
+      "name": "一阶导数"
+    },
+    "msc_normalization": {
+      "method": "msc_normalization",
+      "params": {},
+      "name": "MSC归一化"
+    },
+    "normalize_max": {
+      "method": "normalize_max",
+      "params": {},
+      "name": "最大值归一化"
+    },
+    "area_normalization": {
+      "method": "area_normalization",
+      "params": {},
+      "name": "面积归一化"
+    }
+  },
+  "_available_resampling_methods": {
+    "cubic_spline": "三次样条插值 (默认, 平滑且连续，适合大多数光谱)",
+    "pchip": "PCHIP插值 (保形插值, 避免在峰值附近产生虚假振荡)",
+    "akima": "Akima插值 (介于样条和线性之间, 对离群点不敏感)",
+    "linear": "线性插值 (简单连接两点, 计算最快)",
+    "nearest": "最近邻插值 (阶梯状, 通常不推荐用于光谱)"
   }
+  
+  
 }

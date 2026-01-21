@@ -13,6 +13,10 @@ def _set_plot_style():
     """统一设置绘图样式"""
     plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans', 'Arial Unicode MS']
     plt.rcParams['axes.unicode_minus'] = False
+    plt.rcParams['figure.dpi'] = 300
+    plt.rcParams['savefig.dpi'] = 300
+    plt.rcParams['axes.grid'] = True
+    plt.rcParams['grid.alpha'] = 0.3
 
 _set_plot_style()
 
@@ -32,7 +36,7 @@ def calculate_snr(spectrum: np.ndarray) -> float:
     """计算光谱的信噪比 (Signal-to-Noise Ratio)"""
     if spectrum.size == 0: return 0.0
     signal = np.max(spectrum) - np.min(spectrum)
-    noise = np.std(spectrum)
+    noise = np.std(spectrum)    
     return signal / noise if noise != 0 else 0
 
 def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float]:
@@ -66,7 +70,7 @@ def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, fl
 def plot_true_vs_pred_scatter(y_true, y_pred, element_name, filepath):
     """绘制真实值与预测值散点图"""
     _set_plot_style()
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(8, 6), dpi=300)
     ax.scatter(y_true, y_pred, alpha=0.6, edgecolors='black', linewidth=0.5)
     
     r2 = r2_score(y_true, y_pred)
@@ -112,12 +116,12 @@ def plot_results(val_lq: np.ndarray, val_hq: np.ndarray, val_pred: np.ndarray,
     rmse_calib = np.sqrt(mean_squared_error(hq, pred))
     corr_calib = np.corrcoef(hq, pred)[0, 1]
     
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True, dpi=300)
     
     # 子图1: 光谱对比
-    ax1.plot(wl, lq, 'gray', alpha=0.5, label='Input LQ (Resampled)', linewidth=1)
-    ax1.plot(wl, hq, 'b-', label='Target HQ', linewidth=1.5, alpha=0.8)
-    ax1.plot(wl, pred, 'r--', label='Predicted HQ', linewidth=1.5)
+    ax1.plot(wl, lq, 'gray', alpha=0.5, label='Input LQ (Resampled)', linewidth=0.8)
+    ax1.plot(wl, hq, 'b-', label='Target HQ', linewidth=1.0, alpha=0.8)
+    ax1.plot(wl, pred, 'r--', label='Predicted HQ', linewidth=1.0)
     
     ax1.set_ylabel('Intensity (a.u.)')
     ax1.set_title(f"{title} - Sample {sample_idx}\nRMS={rmse_calib:.2f}, Corr={corr_calib:.4f}")
@@ -126,7 +130,7 @@ def plot_results(val_lq: np.ndarray, val_hq: np.ndarray, val_pred: np.ndarray,
     
     # 子图2: 残差
     error = hq - pred
-    ax2.plot(wl, error, 'k-', linewidth=1)
+    ax2.plot(wl, error, 'k-', linewidth=0.8)
     ax2.axhline(0, color='r', linestyle=':', alpha=0.5)
     ax2.set_xlabel('Wavelength (nm)')
     ax2.set_ylabel('Residual (Target - Pred)')
@@ -138,7 +142,7 @@ def plot_results(val_lq: np.ndarray, val_hq: np.ndarray, val_pred: np.ndarray,
     # 保存
     save_dir = os.path.join(timestamp_dir, "model_analysis")
     os.makedirs(save_dir, exist_ok=True)
-    filename = f"spectral_calibration_sample_{sample_idx}_{datetime.now().strftime('%H%M%S')}.png"
+    filename = f"spectral_calibration_sample_{sample_idx}_{datetime.now().strftime('%H%M%S')}.png"    
     plt.savefig(os.path.join(save_dir, filename), dpi=150)
     plt.close()
     print(f"   [Plot] 校准效果图已保存: {filename}")
