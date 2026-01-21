@@ -1,0 +1,34 @@
+{
+  "paths": {
+    "base_dir": "D:\\project\\plsr\\data",
+    "lq_dir_name": "low_quality_target_spectra",
+    "hq_dir_name": "high_quality_source_spectra",
+    "element_file_name": "标准岩石样品5样品-2.xlsx",
+    "output_dir": "results"
+  },
+  "preprocessing": {
+    "resampling_method": "cubic_spline",
+    "steps": [
+      {
+        "method": "baseline_correction",
+        "params": {"degree": 3},
+        "name": "基线校正"
+      },
+      {
+        "method": "smoothing",
+        "params": {"method": "savgol", "window_length": 5},
+        "name": "SG平滑"
+      },
+      {
+        "method": "snv_normalization",
+        "params": {},
+        "name": "SNV归一化"
+      }
+    ]
+  },
+  "model": {
+    "max_components": 15,
+    "test_size": 0.2,
+    "random_state": 42
+  }
+}
