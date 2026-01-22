@@ -106,7 +106,7 @@ class ElementPredictionPipeline:
             max_c = min(15, len(y_train_valid) - 1, X_train_valid.shape[1] - 1)
             if max_c < 1: max_c = 1
             
-            opt_n = find_optimal_components_for_element(
+            opt_n, cv_q2 = find_optimal_components_for_element(
                 X_train_valid, y_train_valid, 
                 max_components=max_c, 
                 parsimony_threshold=self.parsimony_threshold, 
@@ -141,7 +141,7 @@ class ElementPredictionPipeline:
             }
 
             self.element_models[element] = {'model': pls, 'n_components': opt_n}
-            print(f"    - {element:<5}: n={opt_n:<2}, Train R2={r2_train:.4f}")
+            print(f"    - {element:<5}: n={opt_n:<2}, Train R2={r2_train:.4f}, CV Q2={cv_q2:.4f}")
 
         # 2. 验证集评估
         validation_source = val_spectra if val_spectra is not None else spectra

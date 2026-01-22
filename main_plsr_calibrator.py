@@ -348,13 +348,13 @@ def main():
         print("   [Strategy] 启用差异学习 (Difference Learning: HQ - LQ)...")
         train_target = train_hq - train_lq
         # 传入 X_base=train_lq 以便在 CV 寻优时计算重构后的相关性
-        optimal_n = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model, X_base=train_lq)
+        optimal_n, best_score = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model, X_base=train_lq)
     else:
         print("   [Strategy] 标准直接学习 (Direct Learning: HQ)...")
         train_target = train_hq
-        optimal_n = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model)
+        optimal_n, best_score = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model)
         
-    print(f"   ✅ 最优主成分数: {optimal_n}")
+    print(f"   ✅ 最优主成分数: {optimal_n} (CV Score: {best_score:.4f})")
     
     # 4.2 训练
     calib_model = PLSRSpectralModel(n_components=optimal_n, scale=scale_model)

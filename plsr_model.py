@@ -1,12 +1,10 @@
 import numpy as np
 from sklearn.cross_decomposition import PLSRegression
-from sklearn.model_selection import LeaveOneOut, cross_val_score
+from sklearn.model_selection import LeaveOneOut, cross_val_predict
 from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
 import os
 import pickle
-from joblib import Parallel, delayed, cpu_count
-from joblib import cpu_count
 from typing import Optional
 
 class PLSRSpectralModel:
@@ -41,25 +39,6 @@ class PLSRSpectralModel:
         self.is_fitted = True
         self.n_components = self.model.n_components
 
-def _fit_predict_loo_corr(train_idx, val_idx, X, Y, n_comp, scale=False, X_base=None):
-    """辅助函数：单次 LOO 任务，用于校准任务（目标是相关性）"""
-    pls = PLSRegression(n_components=n_comp, scale=scale)
-    pls.fit(X[train_idx], Y[train_idx])
-    
-    # 校准模式下，输入是X(LQ), 输出是Y(HQ) 或 Y(Diff)
-    pred = pls.predict(X[val_idx]) # (1, n_features)
-    true_val = Y[val_idx]          # (1, n_features)
-    
-    # 如果提供了基准光谱 (X_base)，则先重构再计算相关性 (Pred_HQ = LQ + Pred_Diff)
-    if X_base is not None:
-        pred = pred + X_base[val_idx]
-        true_val = true_val + X_base[val_idx]
-    
-    # 计算两个向量(光谱)的相关性
-    # flatten确保变成 1D 数组进行对比
-    c = np.corrcoef(true_val.flatten(), pred.flatten())[0, 1]
-    return c if not np.isnan(c) else 0.0
-
 def find_optimal_components(X: np.ndarray, Y: np.ndarray, 
                            max_components: int = 15, 
                            task_type: str = 'calibration',
@@ -67,7 +46,7 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
                            parsimony_threshold: float = 0.01,
                            scale: bool = False,
                            X_base: Optional[np.ndarray] = None,
-                           element_name: Optional[str] = None) -> int:
+                           element_name: Optional[str] = None) -> tuple:
     """
     自动参数寻优 (并行版 LOO-CV)
     """
@@ -80,64 +59,101 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
     if limit < 1: limit = 1
     
     components_range = range(1, limit + 1)
-    scores = []
+    score_list = []
+    mse_values = []
+    se_values = []
     
-    print(f"   [Auto-ML] 启动并行 LOO-CV 寻优 (Task: {task_type}, Max: {limit}, Scale: {scale}, CPU: {cpu_count()})...")
+    print(f"   [Auto-ML] 启动并行 LOO-CV 寻优 (Task: {task_type}, Max: {limit}, Scale: {scale})...")
     
     loo = LeaveOneOut()
     
     for n in components_range:
-        # 1. 元素预测任务 (单目标数值回归，优化 RMSE)
+        model = PLSRegression(n_components=n, scale=scale)
+        
+        # 使用 cross_val_predict 获取所有样本的留一法预测值
+        # 这比手动循环更高效且代码更整洁，同时支持并行
+        try:
+            y_cv = cross_val_predict(model, X, Y, cv=loo, n_jobs=-1)
+        except Exception as e:
+            print(f"      [Warning] CV failed for n={n}: {e}")
+            score_list.append(np.inf if task_type == 'prediction' else -1.0)
+            continue
+
         if task_type == 'prediction':
-            # scoring='neg_root_mean_squared_error' 返回负的RMSE
-            cv_scores = cross_val_score(
-                PLSRegression(n_components=n, scale=scale), 
-                X, Y, 
-                cv=loo, 
-                scoring='neg_mean_squared_error', 
-                n_jobs=-1
-            )
-            # 计算 RMSE (Root Mean Squared Error)
-         
-            rmse = np.sqrt(np.mean(-cv_scores))
-            scores.append(rmse)
+            # 1. 元素预测任务 (优化 RMSE)
+            mse = mean_squared_error(Y, y_cv)
+            rmse = np.sqrt(mse)
+            score_list.append(rmse)
             
-        # 2. 光谱校准任务 (多目标波形拟合，优化相关性)
-        else:
-            results = Parallel(n_jobs=-1)(
-                delayed(_fit_predict_loo_corr)(train_idx, val_idx, X, Y, n, scale, X_base)
-                for train_idx, val_idx in loo.split(X)
-            )
-            scores.append(np.mean(np.array(results)))
+            # 计算 MSE 的标准误 (Standard Error) 用于 1-SE 准则
+            # SE = std(squared_errors) / sqrt(N)
+            sq_errors = (Y.flatten() - y_cv.flatten()) ** 2
+            se = np.std(sq_errors, ddof=1) / np.sqrt(len(sq_errors))
+            mse_values.append(mse)
+            se_values.append(se)
+            
+        else: 
+            # 2. 光谱校准任务 (优化相关性)
+            # 处理差异学习的重构
+            if X_base is not None:
+                y_final_pred = y_cv + X_base
+                y_final_true = Y + X_base
+            else:
+                y_final_pred = y_cv
+                y_final_true = Y
+            
+            # 向量化计算行相关性 (比逐个循环快)
+            # Center the data
+            pred_mean = np.mean(y_final_pred, axis=1, keepdims=True)
+            true_mean = np.mean(y_final_true, axis=1, keepdims=True)
+            pred_c = y_final_pred - pred_mean
+            true_c = y_final_true - true_mean
+            
+            # Calculate correlation
+            num = np.sum(pred_c * true_c, axis=1)
+            den = np.sqrt(np.sum(pred_c**2, axis=1) * np.sum(true_c**2, axis=1))
+            
+            # Handle division by zero
+            valid = den > 1e-9
+            corrs = np.zeros(len(Y))
+            corrs[valid] = num[valid] / den[valid]
+            
+            score_list.append(np.mean(corrs))
+
+    scores = np.array(score_list)
 
     # --- 优化主成分选择策略 (简约原则) ---
     if task_type == 'prediction':
-        best_idx = np.argmin(scores)
-    else:
-        best_idx = np.argmax(scores)
-    best_score = scores[best_idx]
-    optimal_idx = best_idx
-    
-    # 阈值 (parsimony_threshold)。允许性能比最佳值差一定比例以换取更简单的模型
-    threshold = parsimony_threshold
-    
-    # 从头遍历，找到第一个满足“性能接近最佳”的主成分数
-    for i in range(best_idx):
-        current_score = scores[i]
+        # 策略 A: 1-SE Rule (一倍标准误准则) - 更科学的防过拟合策略
+        # 找到 MSE 最小的点
+        best_idx = np.argmin(mse_values)
+        min_mse = mse_values[best_idx]
+        min_se = se_values[best_idx]
+        best_score = scores[best_idx] # RMSE
         
-        if task_type == 'prediction':
-            # scores 是正 RMSE (例如 best = 0.100)
-            # 我们允许误差增加 1%: target = 0.100 * 1.01 = 0.101
-            # 如果 current (0.1005) <= 0.101，说明误差在允许范围内，接受这个更简单的模型
-            if current_score <= best_score * (1 + threshold):
+        # 目标阈值 = 最小MSE + 它的标准误
+        # 我们选择满足 MSE <= (Min_MSE + SE) 的最简单的模型
+        target_threshold = min_mse + min_se
+        
+        optimal_idx = best_idx
+        for i in range(best_idx):
+            if mse_values[i] <= target_threshold:
                 optimal_idx = i
                 break
-        else:
+                
+    else:
+        # 策略 B: 相关性任务保持原有的百分比阈值策略
+        best_idx = np.argmax(scores)
+        best_score = scores[best_idx]
+        optimal_idx = best_idx
+        
+        # 阈值 (parsimony_threshold)
+        threshold = parsimony_threshold
+        
+        for i in range(best_idx):
+            current_score = scores[i]
             # scores 是 Correlation (例如 best = 0.999)
             # 修正逻辑：将 "1 - Correlation" 视为误差 (Dissimilarity)
-            # 允许误差比最佳误差增加 threshold %
-            # 例如：Best=0.999 (Err=0.001), Th=0.01 => Allowed Err=0.00101 => Min Score=0.99899
-            # 这样可以防止 n=1 (Score=0.99) 这种虽然相关性高但细节丢失的模型被误选
             best_error = 1.0 - best_score
             current_error = 1.0 - current_score
             
@@ -147,8 +163,23 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
     
     optimal_n = components_range[optimal_idx]
     
+    # 计算选定模型的验证指标 (Q2 或 Correlation)
+    if task_type == 'prediction':
+        # Q2 = 1 - (MSE_cv / Var_y)
+        opt_mse = mse_values[optimal_idx]
+        var_y = np.var(Y)
+        if var_y == 0:
+            val_score = 0.0
+        else:
+            val_score = 1.0 - (opt_mse / var_y)
+    else:
+        val_score = scores[optimal_idx]
+
     if optimal_idx != best_idx:
-        print(f"   [Auto-ML] 简约策略生效: 选择 n={optimal_n} (Score: {scores[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best: {best_score:.4f})")
+        if task_type == 'prediction':
+            print(f"   [Auto-ML] 1-SE准则生效: 选择 n={optimal_n} (MSE: {mse_values[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best MSE: {mse_values[best_idx]:.4f}, SE: {se_values[best_idx]:.4f})")
+        else:
+            print(f"   [Auto-ML] 简约策略生效: 选择 n={optimal_n} (Score: {scores[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best: {best_score:.4f})")
     
     if timestamp_dir:
         plt.figure(figsize=(8, 4))
@@ -184,7 +215,7 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
         plt.savefig(os.path.join(save_dir, filename))
         plt.close()
 
-    return optimal_n
+    return optimal_n, val_score
 
 def find_optimal_components_for_element(X, y, max_components=15, parsimony_threshold=0.01, scale=False, timestamp_dir=None, element_name=None):
     return find_optimal_components(X, y, max_components, task_type='prediction', parsimony_threshold=parsimony_threshold, scale=scale, timestamp_dir=timestamp_dir, element_name=element_name)
