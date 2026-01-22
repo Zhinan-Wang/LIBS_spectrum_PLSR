@@ -11,7 +11,7 @@ from typing import List
 from plsr_model import PLSRSpectralModel, find_optimal_components
 from spectral_preprocessing import SpectralPreprocessor, load_spectral_data_from_csv, resample_to_reference, evaluate_resampling_reliability
 from element_prediction_pipeline import ElementPredictionPipeline, load_element_data
-from evaluation_visualization import create_timestamp_directory, plot_results
+from evaluation_visualization import create_timestamp_directory, plot_results, plot_performance_comparison, plot_prediction_scatter_comparison
 from preprocessing_visualization import visualize_complete_preprocessing_pipeline, visualize_preprocessing_step, visualize_resampling_quality, visualize_data_alignment
 
 # 设置中文字体
@@ -263,22 +263,10 @@ def main():
     )
     print("   ✅ 预处理流水线图及单步对比图已生成")
 
-    # 对全量数据应用预处理
-    lq_proc = lq_resampled.copy()
-    hq_proc = hq_avg.copy()
-    
-    # 批量应用预处理步骤 (利用矩阵运算加速)
-    for s in steps:
-        method_name = s['method']
-        params = s.get('params', {})
-        if hasattr(preprocessor, method_name):
-            print(f"   执行预处理: {s['name']}")
-            lq_proc = getattr(preprocessor, method_name)(lq_proc, **params)
-            hq_proc = getattr(preprocessor, method_name)(hq_proc, **params)
-            
     # 4. 模型训练与寻优 (功能 B)
     print("\n[Step 3] 训练光谱校准模型...")
-    # 划分数据集
+    
+    # 4.0 先划分数据集 (Indices)
     manual_split = config['model'].get('manual_split', {})
     
     if manual_split.get('enabled', False):
@@ -317,31 +305,70 @@ def main():
             
         train_idx = sorted(list(train_idx_set))
         val_idx = sorted(list(val_idx_set))
-        
-        train_lq, val_lq = lq_proc[train_idx], lq_proc[val_idx]
-        train_hq, val_hq = hq_proc[train_idx], hq_proc[val_idx]
     else:
         test_size = config['model'].get('test_size', 0.2)
         random_state = config['model'].get('random_state', 42)
-        train_lq, val_lq, train_idx, val_idx = train_test_split(lq_proc, range(len(lq_proc)), test_size=test_size, random_state=random_state)
-        train_hq, val_hq = hq_proc[train_idx], hq_proc[val_idx] # HQ也使用相同的预处理，保证对比公平性
+        # 仅划分索引
+        train_idx, val_idx = train_test_split(range(len(lq_resampled)), test_size=test_size, random_state=random_state)
+
+    # 提取初始数据 (Raw)
+    train_lq = lq_resampled[train_idx].copy()
+    val_lq = lq_resampled[val_idx].copy()
+    train_hq = hq_avg[train_idx].copy()
+    val_hq = hq_avg[val_idx].copy()
+
+    # 4.1 再应用预处理 (分别处理训练集和验证集，防止泄漏)
+    for s in steps:
+        method_name = s['method']
+        params = s.get('params', {})
+        if hasattr(preprocessor, method_name):
+            print(f"   执行预处理: {s['name']} (Train/Val 分离处理)")
+            train_lq = getattr(preprocessor, method_name)(train_lq, **params)
+            val_lq = getattr(preprocessor, method_name)(val_lq, **params)
+            train_hq = getattr(preprocessor, method_name)(train_hq, **params)
+            val_hq = getattr(preprocessor, method_name)(val_hq, **params)
+
+    # 4.2 重组全量数据 (用于后续 Pipeline)
+    lq_proc = np.zeros((len(lq_resampled), train_lq.shape[1]))
+    lq_proc[train_idx] = train_lq
+    lq_proc[val_idx] = val_lq
+    
+    hq_proc = np.zeros((len(hq_avg), train_hq.shape[1]))
+    hq_proc[train_idx] = train_hq
+    hq_proc[val_idx] = val_hq
 
     # 4.1 自动寻优
     print("   >>> 正在进行 LOO-CV 自动寻找最优主成分数...")
     max_comp = config['model'].get('max_components', 15)
     parsimony_threshold = config['model'].get('parsimony_threshold', 0.01)
     scale_model = config['model'].get('scale', False) # 默认为 False
-    optimal_n = find_optimal_components(train_lq, train_hq, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model)
+    learn_diff = config['model'].get('learn_difference', False)
+    
+    if learn_diff:
+        print("   [Strategy] 启用差异学习 (Difference Learning: HQ - LQ)...")
+        train_target = train_hq - train_lq
+        # 传入 X_base=train_lq 以便在 CV 寻优时计算重构后的相关性
+        optimal_n = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model, X_base=train_lq)
+    else:
+        print("   [Strategy] 标准直接学习 (Direct Learning: HQ)...")
+        train_target = train_hq
+        optimal_n = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model)
+        
     print(f"   ✅ 最优主成分数: {optimal_n}")
     
     # 4.2 训练
     calib_model = PLSRSpectralModel(n_components=optimal_n, scale=scale_model)
-    calib_model.fit(train_lq, train_hq)
+    calib_model.fit(train_lq, train_target)
     
     # 4.3 评估
-    val_pred = calib_model.predict(val_lq)
+    if learn_diff:
+        val_diff_pred = calib_model.predict(val_lq)
+        val_pred = val_lq + val_diff_pred # 重构: LQ + Predicted_Diff
+    else:
+        val_pred = calib_model.predict(val_lq)
+        
     print(f"   光谱校准验证集 R²: {r2_score(val_hq.flatten(), val_pred.flatten()):.4f}")
-    plot_results(val_lq, val_hq, val_pred, hq_wl_trim, sample_idx=0, title="校准效果", timestamp_dir=timestamp_dir)
+    plot_results(val_lq, val_hq, val_pred, hq_wl_trim, sample_idx=0, title=f"校准效果 ({'Diff' if learn_diff else 'Direct'})", timestamp_dir=timestamp_dir)
 
     # 5. 多模式元素预测 (功能 C)
     print("\n[Step 4] 执行元素预测 (LQ-only vs Calib-Spec vs HQ-only)...")
@@ -360,19 +387,37 @@ def main():
     # 模式2: Calib-Spec
     print("\n   [Mode 2] Calib-Spec (核心: Train on HQ, Test on Calib-LQ)")
     # 生成全量校准光谱
-    lq_calibrated = calib_model.predict(lq_proc)
+    if learn_diff:
+        lq_calibrated_diff = calib_model.predict(lq_proc)
+        lq_calibrated = lq_proc + lq_calibrated_diff
+    else:
+        lq_calibrated = calib_model.predict(lq_proc)
+        
     res_calib = pipeline.train_element_models_hq_train_calib_test(hq_proc, lq_calibrated, element_data, train_idx, val_idx, timestamp_dir)
     
     # 模式3: HQ-only
     print("\n   [Mode 3] HQ-only (上限)")
     res_hq = pipeline.train_element_models_with_hq_only(hq_proc, element_data, train_idx, val_idx, timestamp_dir)
 
+    # 模式4: Calib-Self (实用模式)
+    print("\n   [Mode 4] Calib-Self (实用: Train on Calib-LQ, Test on Calib-LQ)")
+    res_calib_self = pipeline.train_element_models_with_calibrated_spectra(lq_calibrated, element_data, train_idx, val_idx, timestamp_dir)
+
+    # 5.1 生成对比图表
+    print("\n[Step 5] 生成综合对比分析图...")
+    plot_performance_comparison(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self)
+    
+    common_elements = set(res_lq.keys()) & set(res_calib.keys()) & set(res_hq.keys()) & set(res_calib_self.keys())
+    for elem in common_elements:
+        plot_prediction_scatter_comparison(res_lq, res_calib, res_hq, elem, timestamp_dir, res_calib_self)
+
     # 6. 打印总结
-    print("\n[Step 5] 总结 - 关键元素 (SiO2) R² 对比:")
+    print("\n[Summary] 关键元素 (SiO2) R² 对比:")
     elem = 'SiO2 ' # 确保列名匹配
     if elem in res_lq:
         print(f"   LQ-only : {res_lq[elem]['r2']:.4f}")
-        print(f"   Calib   : {res_calib[elem]['r2']:.4f}")
+        print(f"   Calib   : {res_calib[elem]['r2']:.4f} (Mode 2)")
+        print(f"   Calib-S : {res_calib_self[elem]['r2']:.4f} (Mode 4)")
         print(f"   HQ-only : {res_hq[elem]['r2']:.4f}")
         
     print(f"\n✅ 完整流程结束！请查看结果文件夹: {timestamp_dir}")

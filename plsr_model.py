@@ -41,14 +41,19 @@ class PLSRSpectralModel:
         self.is_fitted = True
         self.n_components = self.model.n_components
 
-def _fit_predict_loo_corr(train_idx, val_idx, X, Y, n_comp, scale=False):
+def _fit_predict_loo_corr(train_idx, val_idx, X, Y, n_comp, scale=False, X_base=None):
     """辅助函数：单次 LOO 任务，用于校准任务（目标是相关性）"""
     pls = PLSRegression(n_components=n_comp, scale=scale)
     pls.fit(X[train_idx], Y[train_idx])
     
-    # 校准模式下，输入是X(LQ), 输出是Y(HQ)
+    # 校准模式下，输入是X(LQ), 输出是Y(HQ) 或 Y(Diff)
     pred = pls.predict(X[val_idx]) # (1, n_features)
     true_val = Y[val_idx]          # (1, n_features)
+    
+    # 如果提供了基准光谱 (X_base)，则先重构再计算相关性 (Pred_HQ = LQ + Pred_Diff)
+    if X_base is not None:
+        pred = pred + X_base[val_idx]
+        true_val = true_val + X_base[val_idx]
     
     # 计算两个向量(光谱)的相关性
     # flatten确保变成 1D 数组进行对比
@@ -60,7 +65,9 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
                            task_type: str = 'calibration',
                            timestamp_dir: Optional[str] = None,
                            parsimony_threshold: float = 0.01,
-                           scale: bool = False) -> int:
+                           scale: bool = False,
+                           X_base: Optional[np.ndarray] = None,
+                           element_name: Optional[str] = None) -> int:
     """
     自动参数寻优 (并行版 LOO-CV)
     """
@@ -90,22 +97,24 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
                 scoring='neg_mean_squared_error', 
                 n_jobs=-1
             )
-            # 修正：计算 RMSE (Root Mean Squared Error)
-            # 之前代码计算的是 MAE (Mean Absolute Error): np.mean(np.sqrt(-cv_scores))
-            # 正确逻辑: sqrt(mean(squared_errors))
+            # 计算 RMSE (Root Mean Squared Error)
+         
             rmse = np.sqrt(np.mean(-cv_scores))
-            scores.append(-rmse)
+            scores.append(rmse)
             
         # 2. 光谱校准任务 (多目标波形拟合，优化相关性)
         else:
             results = Parallel(n_jobs=-1)(
-                delayed(_fit_predict_loo_corr)(train_idx, val_idx, X, Y, n, scale)
+                delayed(_fit_predict_loo_corr)(train_idx, val_idx, X, Y, n, scale, X_base)
                 for train_idx, val_idx in loo.split(X)
             )
             scores.append(np.mean(np.array(results)))
 
     # --- 优化主成分选择策略 (简约原则) ---
-    best_idx = np.argmax(scores)
+    if task_type == 'prediction':
+        best_idx = np.argmin(scores)
+    else:
+        best_idx = np.argmax(scores)
     best_score = scores[best_idx]
     optimal_idx = best_idx
     
@@ -117,10 +126,10 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
         current_score = scores[i]
         
         if task_type == 'prediction':
-            # scores 是负 RMSE (例如 best = -0.100)
-            # 我们允许误差增加 1%: target = -0.100 * 1.01 = -0.101
-            # 如果 current (-0.1005) > -0.101，说明误差在允许范围内，接受这个更简单的模型
-            if current_score >= best_score * (1 + threshold):
+            # scores 是正 RMSE (例如 best = 0.100)
+            # 我们允许误差增加 1%: target = 0.100 * 1.01 = 0.101
+            # 如果 current (0.1005) <= 0.101，说明误差在允许范围内，接受这个更简单的模型
+            if current_score <= best_score * (1 + threshold):
                 optimal_idx = i
                 break
         else:
@@ -151,16 +160,31 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
             plt.plot(optimal_n, scores[optimal_idx], 'go', markersize=8, label=f'Selected: {optimal_n}')
             
         plt.axvline(x=optimal_n, color='g', linestyle='--', alpha=0.5)
-        plt.title(f"Optimal Components (LOO-CV) - {task_type}")
-        plt.xlabel("Components"); plt.ylabel("Score")
+        
+        title = f"Optimal Components (LOO-CV) - {task_type}"
+        if element_name:
+            title += f" [{element_name}]"
+        plt.title(title)
+        
+        y_label = "RMSE" if task_type == 'prediction' else "Correlation"
+        plt.xlabel("Components"); plt.ylabel(y_label)
         plt.legend(); plt.grid(True, alpha=0.3)
         
         save_dir = os.path.join(timestamp_dir, "model_analysis")
+        if element_name:
+            save_dir = os.path.join(save_dir, "cv_plots")
         os.makedirs(save_dir, exist_ok=True)
-        plt.savefig(os.path.join(save_dir, f"cv_optimization_{task_type}.png"))
+        
+        filename = f"cv_optimization_{task_type}"
+        if element_name:
+            safe_name = str(element_name).replace(" ", "").replace("/", "_")
+            filename += f"_{safe_name}"
+        filename += ".png"
+        
+        plt.savefig(os.path.join(save_dir, filename))
         plt.close()
 
     return optimal_n
 
-def find_optimal_components_for_element(X, y, max_components=15, parsimony_threshold=0.01, scale=False):
-    return find_optimal_components(X, y, max_components, task_type='prediction', parsimony_threshold=parsimony_threshold, scale=scale)
+def find_optimal_components_for_element(X, y, max_components=15, parsimony_threshold=0.01, scale=False, timestamp_dir=None, element_name=None):
+    return find_optimal_components(X, y, max_components, task_type='prediction', parsimony_threshold=parsimony_threshold, scale=scale, timestamp_dir=timestamp_dir, element_name=element_name)

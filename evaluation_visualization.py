@@ -146,3 +146,117 @@ def plot_results(val_lq: np.ndarray, val_hq: np.ndarray, val_pred: np.ndarray,
     plt.savefig(os.path.join(save_dir, filename), dpi=150)
     plt.close()
     print(f"   [Plot] 校准效果图已保存: {filename}")
+
+def plot_performance_comparison(results_lq: Dict, results_calib: Dict, results_hq: Dict, timestamp_dir: str, results_calib_self: Optional[Dict] = None):
+    """绘制三种模式的 R2, RMSE, MRE 性能对比柱状图"""
+    _set_plot_style()
+    
+    # 找出共同存在的元素
+    keys_sets = [set(results_lq.keys()), set(results_calib.keys()), set(results_hq.keys())]
+    if results_calib_self:
+        keys_sets.append(set(results_calib_self.keys()))
+    
+    elements = sorted(list(set.intersection(*keys_sets)))
+    if not elements: return
+
+    save_dir = os.path.join(timestamp_dir, "model_analysis")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 定义要绘制的指标配置: (字典键名, 显示名称, Y轴标签, 文件名)
+    metrics_config = [
+        ('r2', r'R$^2$', r'R$^2$ Score (验证集)', "performance_comparison_R2.png"),
+        ('rmse', 'RMSE', 'RMSE (均方根误差)', "performance_comparison_RMSE.png"),
+        ('mre', 'MRE', 'MRE (平均相对误差 %)', "performance_comparison_MRE.png")
+    ]
+
+    x = np.arange(len(elements))
+    
+    if results_calib_self:
+        width = 0.2
+        offsets = [-1.5, -0.5, 0.5, 1.5]
+    else:
+        width = 0.25
+        offsets = [-1, 0, 1]
+
+    for key, name, ylabel, filename in metrics_config:
+        vals_lq = [results_lq[e][key] for e in elements]
+        vals_calib = [results_calib[e][key] for e in elements]
+        vals_hq = [results_hq[e][key] for e in elements]
+        vals_calib_self = []
+        if results_calib_self:
+            vals_calib_self = [results_calib_self[e][key] for e in elements]
+
+        fig, ax = plt.subplots(figsize=(14 if results_calib_self else 12, 6), dpi=300)
+        
+        ax.bar(x + offsets[0]*width, vals_lq, width, label='LQ-only (原始)', alpha=0.8, color='gray')
+        ax.bar(x + offsets[1]*width, vals_calib, width, label='Calib-Spec (HQ-Train)', alpha=0.9, color='dodgerblue')
+        if results_calib_self:
+            ax.bar(x + offsets[2]*width, vals_calib_self, width, label='Calib-Self (Calib-Train)', alpha=0.9, color='purple')
+        ax.bar(x + offsets[-1]*width, vals_hq, width, label='HQ-only (理想上限)', alpha=0.8, color='green')
+
+        ax.set_ylabel(ylabel)
+        ax.set_title(f'不同模式下的元素预测性能对比 ({name})')
+        ax.set_xticks(x)
+        ax.set_xticklabels(elements)
+        ax.legend()
+        ax.grid(True, axis='y', alpha=0.3)
+        
+        # 自动调整Y轴下限，如果数据都是正数则从0开始
+        all_vals = vals_lq + vals_calib + vals_hq
+        if results_calib_self: all_vals += vals_calib_self
+        min_val = min(all_vals)
+        if min_val >= 0:
+            ax.set_ylim(bottom=0)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, filename), dpi=300)
+        plt.close()
+        print(f"   [Plot] 性能对比柱状图已保存: {filename}")
+
+def plot_prediction_scatter_comparison(results_lq: Dict, results_calib: Dict, results_hq: Dict, element: str, timestamp_dir: str, results_calib_self: Optional[Dict] = None):
+    """为指定元素绘制三联对比散点图 (LQ vs Calib vs HQ)"""
+    _set_plot_style()
+    
+    if element not in results_lq or element not in results_calib or element not in results_hq:
+        return
+    if results_calib_self and element not in results_calib_self:
+        return
+
+    modes = [('LQ-only', results_lq, 'gray'), ('Calib-Spec (HQ-Train)', results_calib, 'dodgerblue')]
+    if results_calib_self:
+        modes.append(('Calib-Self (Calib-Train)', results_calib_self, 'purple'))
+    modes.append(('HQ-only', results_hq, 'green'))
+    
+    # 计算全局最大最小值以统一坐标轴
+    all_vals = []
+    for _, res, _ in modes:
+        all_vals.extend(res[element]['y_true'])
+        all_vals.extend(res[element]['y_pred'])
+    
+    vmin, vmax = min(all_vals), max(all_vals)
+    margin = (vmax - vmin) * 0.05
+    vmin -= margin
+    vmax += margin
+
+    n_cols = len(modes)
+    fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 5), dpi=300, sharey=True)
+    
+    for ax, (name, res, color) in zip(axes, modes):
+        data = res[element]
+        ax.scatter(data['y_true'], data['y_pred'], alpha=0.6, c=color, edgecolors='k', linewidth=0.5)
+        ax.plot([vmin, vmax], [vmin, vmax], 'r--', alpha=0.6, label='Ideal')
+        
+        ax.set_title(f"{name}\nR$^2$={data['r2']:.3f}  RMSE={data['rmse']:.3f}")
+        ax.set_xlabel("True Value")
+        if ax == axes[0]: ax.set_ylabel("Predicted Value")
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(vmin, vmax)
+        ax.set_ylim(vmin, vmax)
+
+    plt.suptitle(f"Element Prediction Comparison: {element}", fontsize=14, y=1.05)
+    plt.tight_layout()
+    
+    save_dir = os.path.join(timestamp_dir, "element_prediction", "comparison")
+    os.makedirs(save_dir, exist_ok=True)
+    plt.savefig(os.path.join(save_dir, f"compare_{element}.png"), dpi=300, bbox_inches='tight')
+    plt.close()

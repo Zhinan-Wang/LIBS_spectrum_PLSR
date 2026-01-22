@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 from scipy.interpolate import CubicSpline, interp1d, PchipInterpolator, Akima1DInterpolator
-from scipy.signal import savgol_filter, wiener, find_peaks
+from scipy.signal import savgol_filter, wiener, find_peaks, correlate
+from scipy.ndimage import shift
 from scipy import sparse
 from scipy.sparse.linalg import spsolve
 from typing import Tuple, List, Optional, Dict
@@ -196,6 +197,53 @@ class SpectralPreprocessor:
                 output[i] = wiener(spectra[i])
             return output
         return spectra
+
+    @handle_shape
+    def spectral_alignment(self, spectra: np.ndarray, max_shift: int = 10, reference_method: str = 'mean') -> np.ndarray:
+        """
+        光谱对齐 (Spectral Alignment / Shift Correction)
+        基于 FFT 互相关检测并修正光谱的微小位移。
+        
+        :param max_shift: 允许的最大位移像素数。
+        :param reference_method: 'mean' (使用平均光谱作为参考) 或 'first' (使用第一条光谱)。
+        """
+        n_samples, n_points = spectra.shape
+        aligned_spectra = np.zeros_like(spectra)
+        
+        # 1. 确定参考光谱
+        if reference_method == 'first':
+            ref_spec = spectra[0]
+        else:
+            ref_spec = np.mean(spectra, axis=0)
+            
+        # 去除直流分量以便更好地进行互相关
+        ref_centered = ref_spec - np.mean(ref_spec)
+        
+        for i in range(n_samples):
+            curr_spec = spectra[i]
+            curr_centered = curr_spec - np.mean(curr_spec)
+            
+            # 2. 计算互相关 (mode='same' 保持长度一致，中心点在 len/2)
+            cc = correlate(curr_centered, ref_centered, mode='same')
+            
+            # 3. 寻找峰值位移
+            mid_point = len(cc) // 2
+            # 只在 max_shift 范围内搜索，防止匹配到错误的远处峰
+            search_start = max(0, mid_point - max_shift)
+            search_end = min(len(cc), mid_point + max_shift + 1)
+            
+            roi = cc[search_start:search_end]
+            if len(roi) == 0:
+                shift_val = 0
+            else:
+                # lag > 0 表示 curr 向右偏移了，需要向左移回来
+                shift_val = (search_start + np.argmax(roi)) - mid_point
+            
+            # 4. 应用反向位移 (mode='nearest' 填充边界)
+            # shift 函数支持亚像素平移，这里我们使用计算出的整数位移
+            aligned_spectra[i] = shift(curr_spec, -shift_val, mode='nearest')
+            
+        return aligned_spectra
 
     def resample_spectrum(self, wavelengths: np.ndarray, spectrum: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # 简单的单条处理封装

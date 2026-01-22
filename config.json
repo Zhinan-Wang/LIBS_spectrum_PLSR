@@ -9,20 +9,20 @@
   "preprocessing": {
     "resampling_method": ["pchip", "akima", "linear", "nearest", "cubic_spline"],
     "steps": [
-      
-    
       {
-        "method": "smoothing",
-        "params": {"method": "savgol", "window_length": 5},
-        "name": "SG平滑"
+        "method": "snv_normalization",
+      "params": {},
+      "name": "SNV归一化"
       }
+      
       
     ]
   },
   "model": {
     "max_components": 15,
-    "parsimony_threshold": 0.01,
+    "parsimony_threshold": 0.02,
     "scale": false,
+    "learn_difference": true,
     "test_size": 0.2,      
     "random_state": 42,    
     "manual_split": {
@@ -81,6 +81,11 @@
       "method": "area_normalization",
       "params": {},
       "name": "面积归一化"
+    },
+    "spectral_alignment": {
+      "method": "spectral_alignment",
+      "params": { "max_shift": 10, "reference_method": "mean" },
+      "name": "光谱对齐(Shift Correction)"
     }
   },
   "_available_resampling_methods": {

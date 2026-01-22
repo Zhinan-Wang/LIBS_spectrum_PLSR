@@ -86,6 +86,7 @@ class ElementPredictionPipeline:
         if models_dir: os.makedirs(models_dir, exist_ok=True)
 
         self.element_models = {}
+        train_results_dict = {}
         
         for element in self.element_names:
             # 数据转换与对齐
@@ -105,7 +106,14 @@ class ElementPredictionPipeline:
             max_c = min(15, len(y_train_valid) - 1, X_train_valid.shape[1] - 1)
             if max_c < 1: max_c = 1
             
-            opt_n = find_optimal_components_for_element(X_train_valid, y_train_valid, max_components=max_c, parsimony_threshold=self.parsimony_threshold, scale=self.scale)
+            opt_n = find_optimal_components_for_element(
+                X_train_valid, y_train_valid, 
+                max_components=max_c, 
+                parsimony_threshold=self.parsimony_threshold, 
+                scale=self.scale,
+                timestamp_dir=timestamp_dir,
+                element_name=f"{mode_name}_{element}"
+            )
             
             # 训练模型
             pls = PLSRegression(n_components=opt_n, scale=self.scale)
@@ -122,7 +130,16 @@ class ElementPredictionPipeline:
             # 记录训练集指标
             y_pred_train = pls.predict(X_train_valid).flatten()
             r2_train = r2_score(y_train_valid, y_pred_train)
+            rmse_train = np.sqrt(mean_squared_error(y_train_valid, y_pred_train))
             
+            # 记录训练结果以便后续合并绘图
+            train_results_dict[element] = {
+                'y_true': y_train_valid,
+                'y_pred': y_pred_train,
+                'r2': r2_train,
+                'rmse': rmse_train
+            }
+
             self.element_models[element] = {'model': pls, 'n_components': opt_n}
             print(f"    - {element:<5}: n={opt_n:<2}, Train R2={r2_train:.4f}")
 
@@ -132,7 +149,8 @@ class ElementPredictionPipeline:
             validation_source[val_indices], element_data.iloc[val_indices], 
             val_indices=list(range(len(val_indices))),
             title_prefix=mode_name, 
-            timestamp_dir=timestamp_dir
+            timestamp_dir=timestamp_dir,
+            train_results=train_results_dict
         )
 
     # 接口保持兼容
@@ -148,7 +166,7 @@ class ElementPredictionPipeline:
     def train_element_models_hq_train_calib_test(self, hq_spectra, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None):
         return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "Calib-Spec(HQ-Train)", timestamp_dir, val_spectra=calibrated_spectra)
 
-    def evaluate_element_prediction_on_validation_set(self, calibrated_spectra, element_data, val_indices, title_prefix="", timestamp_dir=None):
+    def evaluate_element_prediction_on_validation_set(self, calibrated_spectra, element_data, val_indices, title_prefix="", timestamp_dir=None, train_results=None):
         results = {}
         out_dir = os.path.join(timestamp_dir, "element_prediction") if timestamp_dir else None
         if out_dir: os.makedirs(out_dir, exist_ok=True)
@@ -180,19 +198,51 @@ class ElementPredictionPipeline:
             
             results[element] = {
                 'r2': r2, 'rmse': rmse, 'mre': mre, 
-                'n_components': self.element_models[element]['n_components']
+                'n_components': self.element_models[element]['n_components'],
+                'y_true': y_true,
+                'y_pred': y_pred
             }
             
             if out_dir:
-                plt.figure(figsize=(6, 5), dpi=300)
-                plt.scatter(y_true, y_pred, alpha=0.6, edgecolors='k', linewidth=0.5)
-                plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
-                plt.title(f"{title_prefix} {element}\nR2={r2:.3f} RMSE={rmse:.3f}")
-                plt.xlabel("True"); plt.ylabel("Pred")
-                plt.grid(True, alpha=0.3)
-                plt.tight_layout()
-                plt.savefig(os.path.join(out_dir, f"val_{title_prefix}_{element}.png"), dpi=300)
-                plt.close()
+                train_res = train_results.get(element) if train_results else None
+                
+                if train_res:
+                    # 合并绘图：左边训练集，右边验证集
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), dpi=300)
+                    
+                    # Train Plot
+                    t_true, t_pred = train_res['y_true'], train_res['y_pred']
+                    ax1.scatter(t_true, t_pred, alpha=0.6, edgecolors='k', linewidth=0.5, label='Train')
+                    vmin_t = min(t_true.min(), t_pred.min())
+                    vmax_t = max(t_true.max(), t_pred.max())
+                    ax1.plot([vmin_t, vmax_t], [vmin_t, vmax_t], 'r--', alpha=0.8)
+                    ax1.set_title(f"{title_prefix} (Train) - {element}\nR2={train_res['r2']:.3f} RMSE={train_res['rmse']:.3f}")
+                    ax1.set_xlabel("True"); ax1.set_ylabel("Pred")
+                    ax1.grid(True, alpha=0.3)
+                    
+                    # Val Plot
+                    ax2.scatter(y_true, y_pred, alpha=0.6, edgecolors='k', linewidth=0.5, color='orange', label='Val')
+                    vmin_v = min(y_true.min(), y_pred.min())
+                    vmax_v = max(y_true.max(), y_pred.max())
+                    ax2.plot([vmin_v, vmax_v], [vmin_v, vmax_v], 'r--', alpha=0.8)
+                    ax2.set_title(f"{title_prefix} (Val) - {element}\nR2={r2:.3f} RMSE={rmse:.3f}")
+                    ax2.set_xlabel("True"); ax2.set_ylabel("Pred")
+                    ax2.grid(True, alpha=0.3)
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(out_dir, f"pred_{title_prefix}_{element}.png"), dpi=300)
+                    plt.close()
+                else:
+                    # 仅验证集绘图 (旧逻辑)
+                    plt.figure(figsize=(6, 5), dpi=300)
+                    plt.scatter(y_true, y_pred, alpha=0.6, edgecolors='k', linewidth=0.5)
+                    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+                    plt.title(f"{title_prefix} {element}\nR2={r2:.3f} RMSE={rmse:.3f}")
+                    plt.xlabel("True"); plt.ylabel("Pred")
+                    plt.grid(True, alpha=0.3)
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(out_dir, f"val_{title_prefix}_{element}.png"), dpi=300)
+                    plt.close()
                 
         save_results_to_run_folder(results, timestamp_dir, title_prefix)
         return results
