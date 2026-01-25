@@ -3,6 +3,7 @@ from sklearn.cross_decomposition import PLSRegression
 from sklearn.model_selection import LeaveOneOut, cross_val_predict
 from sklearn.metrics import mean_squared_error
 import matplotlib.pyplot as plt
+from scipy.stats import f
 import os
 import pickle
 from typing import Optional
@@ -46,7 +47,10 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
                            parsimony_threshold: float = 0.01,
                            scale: bool = False,
                            X_base: Optional[np.ndarray] = None,
-                           element_name: Optional[str] = None) -> tuple:
+                           element_name: Optional[str] = None,
+                           selection_method: str = "1-se",
+                           f_test_alpha: float = 0.05,
+                           wold_r_threshold: float = 0.95) -> tuple:
     """
     自动参数寻优 (并行版 LOO-CV)
     """
@@ -63,7 +67,7 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
     mse_values = []
     se_values = []
     
-    print(f"   [Auto-ML] 启动并行 LOO-CV 寻优 (Task: {task_type}, Max: {limit}, Scale: {scale})...")
+    print(f"   [Auto-ML] 启动并行 LOO-CV 寻优 (Task: {task_type}, Max: {limit}, Scale: {scale}, Strategy: {selection_method})...")
     
     loo = LeaveOneOut()
     
@@ -124,23 +128,56 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
 
     # --- 优化主成分选择策略 (简约原则) ---
     if task_type == 'prediction':
-        # 策略 A: 1-SE Rule (一倍标准误准则) - 更科学的防过拟合策略
         # 找到 MSE 最小的点
         best_idx = np.argmin(mse_values)
         min_mse = mse_values[best_idx]
         min_se = se_values[best_idx]
         best_score = scores[best_idx] # RMSE
         
-        # 目标阈值 = 最小MSE + 它的标准误
-        # 我们选择满足 MSE <= (Min_MSE + SE) 的最简单的模型
-        target_threshold = min_mse + min_se
-        
         optimal_idx = best_idx
-        for i in range(best_idx):
-            if mse_values[i] <= target_threshold:
-                optimal_idx = i
-                break
-                
+
+        if selection_method == "1-se":
+            # 策略 A: 1-SE Rule (一倍标准误准则) - 防过拟合，适合噪声大数据
+            # 目标阈值 = 最小MSE + 它的标准误
+            target_threshold = min_mse + min_se
+            for i in range(best_idx):
+                if mse_values[i] <= target_threshold:
+                    optimal_idx = i
+                    break
+        elif selection_method == "min_mse":
+            # 策略 B: Min-MSE (最小误差准则) - 追求最高精度，适合欠拟合场景
+            optimal_idx = best_idx
+            
+        elif selection_method == "f_test":
+            # 策略 C: F-test (Haaland & Thomas) - 统计显著性检验
+            # 寻找主成分数 h < h_min，使得 MSE(h) 与 MSE(h_min) 无显著差异
+            f_crit = f.ppf(1 - f_test_alpha, n_samples, n_samples)
+            
+            # 默认选 min_mse，然后尝试向前寻找更简单的模型
+            optimal_idx = best_idx
+            min_mse = mse_values[best_idx]
+            
+            for i in range(best_idx):
+                f_stat = mse_values[i] / min_mse
+                # 如果 F统计量 < 临界值，说明该简化模型与最佳模型无显著差异，可以接受
+                if f_stat <= f_crit:
+                    optimal_idx = i
+                    break
+                    
+        elif selection_method == "wold_r":
+            # 策略 D: Wold's R 准则 (停止规则)
+            # 当 PRESS(k)/PRESS(k-1) > threshold 时停止
+            optimal_idx = 0 # 默认至少 1 个主成分
+            for i in range(1, len(mse_values)):
+                ratio = mse_values[i] / mse_values[i-1]
+                if ratio < wold_r_threshold:
+                    optimal_idx = i
+                else:
+                    break # 停止增加主成分
+        else:
+            # 默认回退
+            optimal_idx = best_idx
+
     else:
         # 策略 B: 相关性任务保持原有的百分比阈值策略
         best_idx = np.argmax(scores)
@@ -177,7 +214,7 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
 
     if optimal_idx != best_idx:
         if task_type == 'prediction':
-            print(f"   [Auto-ML] 1-SE准则生效: 选择 n={optimal_n} (MSE: {mse_values[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best MSE: {mse_values[best_idx]:.4f}, SE: {se_values[best_idx]:.4f})")
+            print(f"   [Auto-ML] {selection_method}准则生效: 选择 n={optimal_n} (MSE: {mse_values[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best MSE: {mse_values[best_idx]:.4f}, SE: {se_values[best_idx]:.4f})")
         else:
             print(f"   [Auto-ML] 简约策略生效: 选择 n={optimal_n} (Score: {scores[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best: {best_score:.4f})")
     
@@ -215,7 +252,13 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
         plt.savefig(os.path.join(save_dir, filename))
         plt.close()
 
-    return optimal_n, val_score
+    # Return history for external plotting
+    history = {
+        'components': list(components_range),
+        'scores': score_list,
+        'metric': 'RMSE' if task_type == 'prediction' else 'Correlation'
+    }
+    return optimal_n, val_score, history
 
-def find_optimal_components_for_element(X, y, max_components=15, parsimony_threshold=0.01, scale=False, timestamp_dir=None, element_name=None):
-    return find_optimal_components(X, y, max_components, task_type='prediction', parsimony_threshold=parsimony_threshold, scale=scale, timestamp_dir=timestamp_dir, element_name=element_name)
+def find_optimal_components_for_element(X, y, max_components=15, parsimony_threshold=0.01, scale=False, timestamp_dir=None, element_name=None, selection_method="1-se", f_test_alpha=0.05, wold_r_threshold=0.95):
+    return find_optimal_components(X, y, max_components, task_type='prediction', parsimony_threshold=parsimony_threshold, scale=scale, timestamp_dir=timestamp_dir, element_name=element_name, selection_method=selection_method, f_test_alpha=f_test_alpha, wold_r_threshold=wold_r_threshold)

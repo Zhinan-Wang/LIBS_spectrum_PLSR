@@ -39,21 +39,44 @@ def save_results_to_run_folder(results_dict: Dict, timestamp_dir: Optional[str],
     for elem, metrics in results_dict.items():
         if isinstance(metrics, dict):
             row = {'Element': elem, 'Model_Type': method_name}
-            # 安全获取指标，默认为0
-            row.update({k: metrics.get(k, 0) for k in ['r2', 'rmse', 'mre', 'n_components']})
+            
+            # 提取验证集指标
+            row.update({k: metrics.get(k, None) for k in ['r2', 'rmse', 'mre', 'n_components']})
+            
+            # 提取训练集指标 (如果存在)
+            if 'train_r2' in metrics:
+                row.update({
+                    'train_r2': metrics.get('train_r2'),
+                    'train_rmse': metrics.get('train_rmse'),
+                    'train_mre': metrics.get('train_mre')
+                })
+                
             data_list.append(row)
             
     if data_list:
-        pd.DataFrame(data_list).to_csv(
+        df = pd.DataFrame(data_list)
+        # 调整列顺序：元素 -> 模型 -> 主成分 -> 训练集指标 -> 验证集指标
+        cols = ['Element', 'Model_Type', 'n_components', 'train_r2', 'train_rmse', 'train_mre', 'r2', 'rmse', 'mre']
+        # 只保留存在的列
+        final_cols = [c for c in cols if c in df.columns]
+        df = df[final_cols]
+        
+        df.to_csv(
             os.path.join(run_dir, f"element_prediction_{method_name}.csv"), 
             index=False, encoding='utf-8-sig'
         )
 
 class ElementPredictionPipeline:
-    def __init__(self, spectral_model: Optional[PLSRSpectralModel] = None, parsimony_threshold: float = 0.01, scale: bool = False):
+    def __init__(self, spectral_model: Optional[PLSRSpectralModel] = None, parsimony_threshold: float = 0.01, scale: bool = False, selection_method: str = "1-se", max_components: int = 15, f_test_alpha: float = 0.05, wold_r_threshold: float = 0.95, feature_selection_config: Optional[Dict] = None, wavelengths: Optional[np.ndarray] = None):
         self.spectral_model = spectral_model
         self.parsimony_threshold = parsimony_threshold
         self.scale = scale
+        self.selection_method = selection_method
+        self.max_components = max_components
+        self.f_test_alpha = f_test_alpha
+        self.wold_r_threshold = wold_r_threshold
+        self.feature_selection_config = feature_selection_config if feature_selection_config else {"enabled": False}
+        self.wavelengths = wavelengths
         self.element_models = {}
         self.element_names = []
         
@@ -64,7 +87,8 @@ class ElementPredictionPipeline:
                        val_indices: List[int],
                        mode_name: str,
                        timestamp_dir: Optional[str] = None,
-                       val_spectra: Optional[np.ndarray] = None) -> Dict:
+                       val_spectra: Optional[np.ndarray] = None,
+                       selection_method: Optional[str] = None) -> Dict:
         """核心通用方法"""
         print(f"\n>>> 启动预测流程: [{mode_name}]")
         
@@ -102,17 +126,74 @@ class ElementPredictionPipeline:
             X_train_valid = spectra[train_indices][mask]
             y_train_valid = y_train[mask]
             
+            # --- 特征选择 (Feature Selection) ---
+            selected_indices = None
+            if self.feature_selection_config.get('enabled', False):
+                method = self.feature_selection_config.get('method', 'pearson')
+                threshold = self.feature_selection_config.get('threshold', 0.1)
+                
+                if method == 'pearson':
+                    # 向量化计算皮尔逊相关系数
+                    # corr = dot(x_c, y_c) / (norm(x_c) * norm(y_c))
+                    X_c = X_train_valid - X_train_valid.mean(axis=0)
+                    y_c = y_train_valid - y_train_valid.mean()
+                    
+                    numer = np.dot(y_c, X_c)
+                    denom = np.linalg.norm(y_c) * np.linalg.norm(X_c, axis=0)
+                    
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        corrs = numer / denom
+                    corrs = np.nan_to_num(corrs) # 处理除零导致的 NaN
+                    
+                    # 筛选绝对值大于阈值的特征
+                    selected_indices = np.where(np.abs(corrs) >= threshold)[0]
+                    
+                    # 兜底机制：如果选出的特征太少 (<10)，则放弃筛选，防止模型无法训练
+                    if len(selected_indices) < 10:
+                        print(f"    [Feature Selection] {element} 筛选后特征过少 ({len(selected_indices)}), 跳过筛选。")
+                        selected_indices = None
+                    else:
+                        X_train_valid = X_train_valid[:, selected_indices]
+                        # print(f"    [Feature Selection] {element} 保留特征: {len(selected_indices)}/{spectra.shape[1]}")
+                
+                elif method == 'roi':
+                    # 基于物理特征窗口 (ROI) 的筛选
+                    if self.wavelengths is None:
+                        print(f"    [Feature Selection] 错误: 选择了 ROI 方法但未提供波长数据。")
+                    else:
+                        roi_ranges_config = self.feature_selection_config.get('roi_ranges', {})
+                        if not isinstance(roi_ranges_config, dict):
+                            roi_ranges_config = {}
+                        # 尝试匹配元素名 (去除空格)
+                        ranges = roi_ranges_config.get(element) or roi_ranges_config.get(element.strip())
+                        
+                        if ranges:
+                            mask = np.zeros(len(self.wavelengths), dtype=bool)
+                            for start_wl, end_wl in ranges:
+                                mask |= (self.wavelengths >= start_wl) & (self.wavelengths <= end_wl)
+                            
+                            selected_indices = np.where(mask)[0]
+                            if len(selected_indices) == 0:
+                                print(f"    [Feature Selection] {element} ROI 范围内无数据，跳过筛选。")
+                                selected_indices = None
+                            else:
+                                X_train_valid = X_train_valid[:, selected_indices]
+                                # print(f"    [Feature Selection] {element} ROI 保留特征: {len(selected_indices)} 点")
+
             # 自动寻优 (限制最大组件数)
-            max_c = min(15, len(y_train_valid) - 1, X_train_valid.shape[1] - 1)
+            max_c = min(self.max_components, len(y_train_valid) - 1, X_train_valid.shape[1] - 1)
             if max_c < 1: max_c = 1
             
-            opt_n, cv_q2 = find_optimal_components_for_element(
+            opt_n, cv_q2, cv_history = find_optimal_components_for_element(
                 X_train_valid, y_train_valid, 
                 max_components=max_c, 
                 parsimony_threshold=self.parsimony_threshold, 
                 scale=self.scale,
                 timestamp_dir=timestamp_dir,
-                element_name=f"{mode_name}_{element}"
+                element_name=f"{mode_name}_{element}",
+                selection_method=selection_method if selection_method else self.selection_method,
+                f_test_alpha=self.f_test_alpha,
+                wold_r_threshold=self.wold_r_threshold
             )
             
             # 训练模型
@@ -131,17 +212,20 @@ class ElementPredictionPipeline:
             y_pred_train = pls.predict(X_train_valid).flatten()
             r2_train = r2_score(y_train_valid, y_pred_train)
             rmse_train = np.sqrt(mean_squared_error(y_train_valid, y_pred_train))
+            mre_train = np.mean(np.abs(y_pred_train - y_train_valid) / (np.abs(y_train_valid) + 1e-9)) * 100
             
             # 记录训练结果以便后续合并绘图
             train_results_dict[element] = {
                 'y_true': y_train_valid,
                 'y_pred': y_pred_train,
                 'r2': r2_train,
-                'rmse': rmse_train
+                'rmse': rmse_train,
+                'mre': mre_train,
+                'cv_history': cv_history
             }
 
-            self.element_models[element] = {'model': pls, 'n_components': opt_n}
-            print(f"    - {element:<5}: n={opt_n:<2}, Train R2={r2_train:.4f}, CV Q2={cv_q2:.4f}")
+            self.element_models[element] = {'model': pls, 'n_components': opt_n, 'selected_features': selected_indices}
+            print(f"    - {element:<5}: n={opt_n:<2}, Train R2={r2_train:.4f}, RMSE={rmse_train:.4f}, MRE={mre_train:.2f}%, CV Q2={cv_q2:.4f}")
 
         # 2. 验证集评估
         validation_source = val_spectra if val_spectra is not None else spectra
@@ -154,17 +238,17 @@ class ElementPredictionPipeline:
         )
 
     # 接口保持兼容
-    def train_element_models_with_lq_only(self, lq_spectra, element_data, train_indices, val_indices, timestamp_dir=None):
-        return self._train_generic(lq_spectra, element_data, train_indices, val_indices, "LQ-only", timestamp_dir)
+    def train_element_models_with_lq_only(self, lq_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
+        return self._train_generic(lq_spectra, element_data, train_indices, val_indices, "LQ-only", timestamp_dir, selection_method=selection_method)
     
-    def train_element_models_with_hq_only(self, hq_spectra, element_data, train_indices, val_indices, timestamp_dir=None):
-        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "HQ-only", timestamp_dir)
+    def train_element_models_with_hq_only(self, hq_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
+        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "HQ-only", timestamp_dir, selection_method=selection_method)
 
-    def train_element_models_with_calibrated_spectra(self, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None):
-        return self._train_generic(calibrated_spectra, element_data, train_indices, val_indices, "Calib-Spec", timestamp_dir)
+    def train_element_models_with_calibrated_spectra(self, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
+        return self._train_generic(calibrated_spectra, element_data, train_indices, val_indices, "Calib-Spec", timestamp_dir, selection_method=selection_method)
 
-    def train_element_models_hq_train_calib_test(self, hq_spectra, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None):
-        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "Calib-Spec(HQ-Train)", timestamp_dir, val_spectra=calibrated_spectra)
+    def train_element_models_hq_train_calib_test(self, hq_spectra, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
+        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "Calib-Spec(HQ-Train)", timestamp_dir, val_spectra=calibrated_spectra, selection_method=selection_method)
 
     def evaluate_element_prediction_on_validation_set(self, calibrated_spectra, element_data, val_indices, title_prefix="", timestamp_dir=None, train_results=None):
         results = {}
@@ -185,6 +269,11 @@ class ElementPredictionPipeline:
             X_val = calibrated_spectra[mask]
             y_true = y_val[mask]
             
+            # 应用特征选择掩码
+            selected_indices = self.element_models[element].get('selected_features')
+            if selected_indices is not None:
+                X_val = X_val[:, selected_indices]
+            
             # 维度匹配检查
             if X_val.shape[0] != y_true.shape[0]:
                 print(f"    错误: {element} 验证数据维度不匹配 X:{X_val.shape} Y:{y_true.shape}")
@@ -196,12 +285,24 @@ class ElementPredictionPipeline:
             rmse = np.sqrt(mean_squared_error(y_true, y_pred))
             mre = np.mean(np.abs(y_pred - y_true) / (np.abs(y_true) + 1e-9)) * 100
             
+            print(f"    - {element:<5}: Val R2={r2:.4f}, RMSE={rmse:.4f}, MRE={mre:.2f}%")
+            
             results[element] = {
                 'r2': r2, 'rmse': rmse, 'mre': mre, 
                 'n_components': self.element_models[element]['n_components'],
                 'y_true': y_true,
                 'y_pred': y_pred
             }
+            
+            # 新增：将训练集指标合并到结果字典中，以便保存到CSV
+            if train_results and element in train_results:
+                t_res = train_results[element]
+                results[element].update({
+                    'train_r2': t_res.get('r2'),
+                    'train_rmse': t_res.get('rmse'),
+                    'train_mre': t_res.get('mre'),
+                    'cv_history': t_res.get('cv_history')
+                })
             
             if out_dir:
                 train_res = train_results.get(element) if train_results else None

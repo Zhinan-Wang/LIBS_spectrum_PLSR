@@ -7,22 +7,54 @@
     "output_dir": "results"
   },
   "preprocessing": {
-    "resampling_method": ["pchip", "akima", "linear", "nearest", "cubic_spline"],
+    "resampling_method": "pchip",
     "steps": [
+   
       {
-        "method": "snv_normalization",
+      "method": "smoothing",
+      "params": { "method": "savgol", "window_length": 9, "polyorder": 3 },
+      "name": "SG平滑"
+      },
+      {
+      "method": "asls_baseline_correction",
+      "params": { "lam": 100000, "p": 0.001, "niter": 10 },
+      "name": "AsLS基线校正"
+      },
+    
+      {
+      "method": "snv_normalization",
       "params": {},
       "name": "SNV归一化"
       }
-      
-      
+     
     ]
   },
   "model": {
     "max_components": 15,
-    "parsimony_threshold": 0.02,
+    "max_components_element": 15,
+    "parsimony_threshold": 0.03,
     "scale": false,
     "learn_difference": true,
+    "component_selection_method": "min_mse",
+    "f_test_alpha": 0.05,
+    "wold_r_threshold": 0.98,
+    "feature_selection": {
+      "enabled": true,
+      "method": "pearson", 
+      "threshold": 0.15,
+      "roi_ranges": {
+        "SiO2": [[288.0, 288.5], [251.0, 252.0]],
+        "Al2O3": [[308.0, 310.0], [396.0, 397.0]],
+        "Fe": [[259.8, 260.0], [274.0, 275.0]],
+        "MgO": [[285.0, 285.5], [279.0, 280.5]]
+      }
+    },
+    "mode_strategies": {
+      "LQ-only": "wold_r",
+      "Calib-Spec": "wold_r",
+      "HQ-only": "wold_r",
+      "Calib-Self": "wold_r"
+    },
     "test_size": 0.2,      
     "random_state": 42,    
     "manual_split": {
@@ -89,7 +121,7 @@
     }
   },
   "_available_resampling_methods": {
-    "cubic_spline": "三次样条插值 (默认, 平滑且连续，适合大多数光谱)",
+    "cubic_spline": "三次样条插值 (, 平滑且连续，适合大多数光谱)",
     "pchip": "PCHIP插值 (保形插值, 避免在峰值附近产生虚假振荡)",
     "akima": "Akima插值 (介于样条和线性之间, 对离群点不敏感)",
     "linear": "线性插值 (简单连接两点, 计算最快)",

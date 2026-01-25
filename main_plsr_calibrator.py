@@ -109,6 +109,162 @@ def align_element_data(element_data: pd.DataFrame, sample_ids: List[str]) -> pd.
             print(f"      注意: 元素表行数 ({len(element_data)}) 与 样品数 ({len(sample_ids)}) 不一致，极大概率错位！")
         return element_data
 
+def plot_component_counts(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self=None):
+    """
+    绘制各模式下各元素的主成分数对比图
+    """
+    if not timestamp_dir: return
+    
+    save_dir = os.path.join(timestamp_dir, "model_analysis")
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. 汇总数据
+    models = [('LQ-only', res_lq), ('Calib-Spec', res_calib), ('HQ-only', res_hq)]
+    if res_calib_self:
+        models.append(('Calib-Self', res_calib_self))
+        
+    all_elements = set()
+    for _, res in models:
+        if res:
+            all_elements.update(res.keys())
+    
+    sorted_elements = sorted(list(all_elements))
+    
+    # 准备绘图数据
+    plot_data = {elem: [] for elem in sorted_elements}
+    
+    for name, res in models:
+        for elem in sorted_elements:
+            if res and elem in res:
+                n = res[elem].get('n_components', 0)
+                plot_data[elem].append(n)
+            else:
+                plot_data[elem].append(0)
+                
+    # --- 图1: 综合对比图 (Grouped Bar Chart) ---
+    x = np.arange(len(sorted_elements))
+    total_width = 0.8
+    n_models = len(models)
+    width = total_width / n_models
+    
+    plt.figure(figsize=(max(12, len(sorted_elements)*0.8), 6), dpi=300)
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    
+    for i, (name, _) in enumerate(models):
+        vals = [plot_data[elem][i] for elem in sorted_elements]
+        bar_x = x - (total_width / 2) + (i * width) + (width / 2)
+        plt.bar(bar_x, vals, width, label=name, alpha=0.8, color=colors[i % len(colors)])
+        
+    plt.xlabel('Elements')
+    plt.ylabel('Number of Components')
+    plt.title('Optimal Components by Element and Model')
+    plt.xticks(x, sorted_elements, rotation=45)
+    plt.legend()
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "components_comparison_all.png"))
+    plt.close()
+    
+    # --- 图2-5: 各模式单独图 ---
+    for i, (name, res) in enumerate(models):
+        if not res: continue
+        
+        elems = []
+        comps = []
+        for e in sorted_elements:
+            if e in res:
+                elems.append(e)
+                comps.append(res[e].get('n_components', 0))
+        
+        if not elems: continue
+        
+        plt.figure(figsize=(max(10, len(elems)*0.6), 5), dpi=300)
+        bars = plt.bar(elems, comps, color=colors[i % len(colors)], edgecolor='black', alpha=0.7)
+        plt.xlabel('Elements')
+        plt.ylabel('Number of Components')
+        plt.title(f'Optimal Components - {name}')
+        plt.xticks(rotation=45)
+        plt.grid(axis='y', alpha=0.3)
+        
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                     f'{int(height)}',
+                     ha='center', va='bottom', fontsize=9)
+                     
+        plt.tight_layout()
+        safe_name = name.replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
+        plt.savefig(os.path.join(save_dir, f"components_{safe_name}.png"))
+        plt.close()
+        
+    print(f"   [Plot] 主成分数对比图已保存至: {save_dir}")
+
+def plot_cv_curves(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self=None):
+    """
+    生成各模式下各元素的 CV 寻优曲线 (RMSE vs Components)
+    每个模式生成一张大图，包含所有元素的子图
+    """
+    if not timestamp_dir: return
+    
+    save_dir = os.path.join(timestamp_dir, "model_analysis", "cv_curves")
+    os.makedirs(save_dir, exist_ok=True)
+    
+    models = [('LQ-only', res_lq), ('Calib-Spec', res_calib), ('HQ-only', res_hq)]
+    if res_calib_self:
+        models.append(('Calib-Self', res_calib_self))
+        
+    count = 0
+    for mode_name, results in models:
+        if not results: continue
+        
+        elements = sorted([e for e in results.keys() if 'cv_history' in results[e]])
+        if not elements: continue
+        
+        n_elems = len(elements)
+        cols = 4
+        rows = (n_elems + cols - 1) // cols
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(20, 4 * rows), dpi=200)
+        axes = axes.flatten()
+        
+        for i, elem in enumerate(elements):
+            ax = axes[i]
+            data = results[elem]
+            hist = data['cv_history']
+            
+            x = hist['components']
+            y = hist['scores'] # RMSE
+            opt_n = data.get('n_components', 0)
+            
+            # 绘制曲线
+            ax.plot(x, y, 'b.-', alpha=0.7, linewidth=1)
+            
+            # 标记选定的点
+            if opt_n in x:
+                idx = x.index(opt_n)
+                ax.plot(x[idx], y[idx], 'ro', markersize=6, label=f'Selected: {opt_n}')
+            
+            ax.set_title(f"{elem} (n={opt_n})")
+            ax.set_xlabel("Components")
+            ax.set_ylabel("CV RMSE")
+            ax.grid(True, alpha=0.3)
+            
+        # 隐藏多余的子图
+        for j in range(n_elems, len(axes)):
+            axes[j].axis('off')
+            
+        plt.tight_layout()
+        plt.suptitle(f"CV Optimization Curves - {mode_name}", y=1.02, fontsize=16)
+        safe_name = mode_name.replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
+        plt.savefig(os.path.join(save_dir, f"cv_curves_{safe_name}.png"), bbox_inches='tight')
+        plt.close()
+        count += 1
+        
+    if count > 0:
+        print(f"   [Plot] CV 寻优曲线图已保存至: {save_dir} (共 {count} 张)")
+    else:
+        print(f"   [Plot] ⚠️ 未生成 CV 曲线图 (可能是因为结果中缺少 cv_history 数据)")
+
 def main():
     print("="*80)
     print("      LIBS 光谱校准与元素预测系统 (完整架构版)")
@@ -129,6 +285,12 @@ def main():
     # 创建结果目录
     timestamp_dir = create_timestamp_directory(output_dir_name)
     print(f"📁 结果输出目录: {timestamp_dir}")
+
+    # 保存本次运行的配置快照
+    config_save_path = os.path.join(timestamp_dir, "config_snapshot.json")
+    with open(config_save_path, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    print(f"   [Config] 配置快照已保存: {config_save_path}")
 
     # 2. 数据加载 (自动扫描文件)
     print("\n[Step 1] 数据加载与对齐...")
@@ -340,19 +502,25 @@ def main():
     # 4.1 自动寻优
     print("   >>> 正在进行 LOO-CV 自动寻找最优主成分数...")
     max_comp = config['model'].get('max_components', 15)
+    max_comp_element = config['model'].get('max_components_element', 10)
     parsimony_threshold = config['model'].get('parsimony_threshold', 0.01)
     scale_model = config['model'].get('scale', False) # 默认为 False
     learn_diff = config['model'].get('learn_difference', False)
+    selection_method = config['model'].get('component_selection_method', '1-se')
+    f_test_alpha = config['model'].get('f_test_alpha', 0.05)
+    wold_r_threshold = config['model'].get('wold_r_threshold', 0.95)
+    feature_selection_config = config['model'].get('feature_selection', {"enabled": False})
+    mode_strategies = config['model'].get('mode_strategies', {})
     
     if learn_diff:
         print("   [Strategy] 启用差异学习 (Difference Learning: HQ - LQ)...")
         train_target = train_hq - train_lq
         # 传入 X_base=train_lq 以便在 CV 寻优时计算重构后的相关性
-        optimal_n, best_score = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model, X_base=train_lq)
+        optimal_n, best_score, _ = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model, X_base=train_lq)
     else:
         print("   [Strategy] 标准直接学习 (Direct Learning: HQ)...")
         train_target = train_hq
-        optimal_n, best_score = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model)
+        optimal_n, best_score, _ = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model)
         
     print(f"   ✅ 最优主成分数: {optimal_n} (CV Score: {best_score:.4f})")
     
@@ -378,14 +546,16 @@ def main():
     # --- 关键修复：执行数据对齐 ---
     element_data = align_element_data(element_data, sample_ids)
 
-    pipeline = ElementPredictionPipeline(spectral_model=calib_model, parsimony_threshold=parsimony_threshold, scale=scale_model)
+    pipeline = ElementPredictionPipeline(spectral_model=calib_model, parsimony_threshold=parsimony_threshold, scale=scale_model, selection_method=selection_method, max_components=max_comp_element, f_test_alpha=f_test_alpha, wold_r_threshold=wold_r_threshold, feature_selection_config=feature_selection_config, wavelengths=hq_wl_trim)
     
     # 模式1: LQ-only
     print("\n   [Mode 1] LQ-only (基准)")
-    res_lq = pipeline.train_element_models_with_lq_only(lq_proc, element_data, train_idx, val_idx, timestamp_dir)
+    strat = mode_strategies.get('LQ-only', selection_method)
+    res_lq = pipeline.train_element_models_with_lq_only(lq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
     
     # 模式2: Calib-Spec
     print("\n   [Mode 2] Calib-Spec (核心: Train on HQ, Test on Calib-LQ)")
+    strat = mode_strategies.get('Calib-Spec', selection_method)
     # 生成全量校准光谱
     if learn_diff:
         lq_calibrated_diff = calib_model.predict(lq_proc)
@@ -393,19 +563,23 @@ def main():
     else:
         lq_calibrated = calib_model.predict(lq_proc)
         
-    res_calib = pipeline.train_element_models_hq_train_calib_test(hq_proc, lq_calibrated, element_data, train_idx, val_idx, timestamp_dir)
+    res_calib = pipeline.train_element_models_hq_train_calib_test(hq_proc, lq_calibrated, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
     
     # 模式3: HQ-only
     print("\n   [Mode 3] HQ-only (上限)")
-    res_hq = pipeline.train_element_models_with_hq_only(hq_proc, element_data, train_idx, val_idx, timestamp_dir)
+    strat = mode_strategies.get('HQ-only', selection_method)
+    res_hq = pipeline.train_element_models_with_hq_only(hq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
 
     # 模式4: Calib-Self (实用模式)
     print("\n   [Mode 4] Calib-Self (实用: Train on Calib-LQ, Test on Calib-LQ)")
-    res_calib_self = pipeline.train_element_models_with_calibrated_spectra(lq_calibrated, element_data, train_idx, val_idx, timestamp_dir)
+    strat = mode_strategies.get('Calib-Self', selection_method)
+    res_calib_self = pipeline.train_element_models_with_calibrated_spectra(lq_calibrated, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
 
     # 5.1 生成对比图表
     print("\n[Step 5] 生成综合对比分析图...")
     plot_performance_comparison(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self)
+    plot_component_counts(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self)
+    plot_cv_curves(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self)
     
     common_elements = set(res_lq.keys()) & set(res_calib.keys()) & set(res_hq.keys()) & set(res_calib_self.keys())
     for elem in common_elements:
