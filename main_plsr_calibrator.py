@@ -8,7 +8,7 @@ import json
 from typing import List
 
 # 导入各模块
-from plsr_model import PLSRSpectralModel, find_optimal_components
+from plsr_model import PLSRSpectralModel, train_calibration_model
 from spectral_preprocessing import SpectralPreprocessor, load_spectral_data_from_csv, resample_to_reference, evaluate_resampling_reliability
 from element_prediction_pipeline import ElementPredictionPipeline, load_element_data
 from evaluation_visualization import create_timestamp_directory, plot_results, plot_performance_comparison, plot_prediction_scatter_comparison
@@ -500,33 +500,40 @@ def main():
     hq_proc[val_idx] = val_hq
 
     # 4.1 自动寻优
-    print("   >>> 正在进行 LOO-CV 自动寻找最优主成分数...")
-    max_comp = config['model'].get('max_components', 15)
-    max_comp_element = config['model'].get('max_components_element', 10)
-    parsimony_threshold = config['model'].get('parsimony_threshold', 0.01)
-    scale_model = config['model'].get('scale', False) # 默认为 False
-    learn_diff = config['model'].get('learn_difference', False)
-    selection_method = config['model'].get('component_selection_method', '1-se')
-    f_test_alpha = config['model'].get('f_test_alpha', 0.05)
-    wold_r_threshold = config['model'].get('wold_r_threshold', 0.95)
+    print("   >>> 正在训练光谱校准模型...")
+    
+    # 获取校准配置
+    calib_config = config['model'].get('calibration', {})
+    # 兼容旧配置 (如果 calibration 不存在)
+    if not calib_config:
+        calib_config = {
+            "method": "PLSR",
+            "params": config['model'] # 尝试使用顶层参数
+        }
+        
+    calib_params = calib_config.get('params', {})
+    learn_diff = calib_params.get('learn_difference', False)
     feature_selection_config = config['model'].get('feature_selection', {"enabled": False})
     mode_strategies = config['model'].get('mode_strategies', {})
     
     if learn_diff:
         print("   [Strategy] 启用差异学习 (Difference Learning: HQ - LQ)...")
         train_target = train_hq - train_lq
-        # 传入 X_base=train_lq 以便在 CV 寻优时计算重构后的相关性
-        optimal_n, best_score, _ = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model, X_base=train_lq)
+        X_base_for_cv = train_lq
     else:
         print("   [Strategy] 标准直接学习 (Direct Learning: HQ)...")
         train_target = train_hq
-        optimal_n, best_score, _ = find_optimal_components(train_lq, train_target, max_components=max_comp, task_type='calibration', timestamp_dir=timestamp_dir, parsimony_threshold=parsimony_threshold, scale=scale_model)
+        X_base_for_cv = None
         
-    print(f"   ✅ 最优主成分数: {optimal_n} (CV Score: {best_score:.4f})")
+    # 调用通用训练函数
+    calib_model, calib_metrics = train_calibration_model(
+        train_lq, train_target, 
+        config=calib_config, 
+        timestamp_dir=timestamp_dir, 
+        X_base=X_base_for_cv
+    )
     
-    # 4.2 训练
-    calib_model = PLSRSpectralModel(n_components=optimal_n, scale=scale_model)
-    calib_model.fit(train_lq, train_target)
+    print(f"   ✅ 校准模型训练完成 (Params: {calib_metrics.get('n_components', 'N/A')}, Score: {calib_metrics.get('score', 0):.4f})")
     
     # 4.3 评估
     if learn_diff:
@@ -546,16 +553,26 @@ def main():
     # --- 关键修复：执行数据对齐 ---
     element_data = align_element_data(element_data, sample_ids)
 
-    pipeline = ElementPredictionPipeline(spectral_model=calib_model, parsimony_threshold=parsimony_threshold, scale=scale_model, selection_method=selection_method, max_components=max_comp_element, f_test_alpha=f_test_alpha, wold_r_threshold=wold_r_threshold, feature_selection_config=feature_selection_config, wavelengths=hq_wl_trim)
+    # 获取预测配置
+    pred_config = config['model'].get('prediction', {})
+    if not pred_config:
+        pred_config = {"method": "PLSR", "params": config['model']}
+
+    pipeline = ElementPredictionPipeline(
+        spectral_model=calib_model, 
+        prediction_config=pred_config,
+        feature_selection_config=feature_selection_config, 
+        wavelengths=hq_wl_trim
+    )
     
     # 模式1: LQ-only
     print("\n   [Mode 1] LQ-only (基准)")
-    strat = mode_strategies.get('LQ-only', selection_method)
+    strat = mode_strategies.get('LQ-only', None)
     res_lq = pipeline.train_element_models_with_lq_only(lq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
     
     # 模式2: Calib-Spec
     print("\n   [Mode 2] Calib-Spec (核心: Train on HQ, Test on Calib-LQ)")
-    strat = mode_strategies.get('Calib-Spec', selection_method)
+    strat = mode_strategies.get('Calib-Spec', None)
     # 生成全量校准光谱
     if learn_diff:
         lq_calibrated_diff = calib_model.predict(lq_proc)
@@ -567,12 +584,12 @@ def main():
     
     # 模式3: HQ-only
     print("\n   [Mode 3] HQ-only (上限)")
-    strat = mode_strategies.get('HQ-only', selection_method)
+    strat = mode_strategies.get('HQ-only', None)
     res_hq = pipeline.train_element_models_with_hq_only(hq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
 
     # 模式4: Calib-Self (实用模式)
     print("\n   [Mode 4] Calib-Self (实用: Train on Calib-LQ, Test on Calib-LQ)")
-    strat = mode_strategies.get('Calib-Self', selection_method)
+    strat = mode_strategies.get('Calib-Self', None)
     res_calib_self = pipeline.train_element_models_with_calibrated_spectra(lq_calibrated, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
 
     # 5.1 生成对比图表

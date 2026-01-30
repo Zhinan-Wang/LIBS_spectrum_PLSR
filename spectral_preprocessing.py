@@ -42,11 +42,17 @@ def _resample_worker(spectrum: np.ndarray, lq_wavelengths: np.ndarray,
         lq_wavelengths = lq_wavelengths[:min_len]
         spectrum = spectrum[:min_len]
     
-    # 确保波长单调递增
+    # 确保波长单调递增且无重复
     if not np.all(np.diff(lq_wavelengths) > 0):
         sorted_idx = np.argsort(lq_wavelengths)
         lq_wavelengths = lq_wavelengths[sorted_idx]
         spectrum = spectrum[sorted_idx]
+        
+        # 去重 (取第一个出现的值)
+        unique_wl, unique_idx = np.unique(lq_wavelengths, return_index=True)
+        if len(unique_wl) < len(lq_wavelengths):
+            lq_wavelengths = lq_wavelengths[unique_idx]
+            spectrum = spectrum[unique_idx]
     
     try:
         if method == 'cubic_spline':

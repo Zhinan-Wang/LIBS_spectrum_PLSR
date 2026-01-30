@@ -5,15 +5,16 @@
 import numpy as np
 import pandas as pd
 from sklearn.cross_decomposition import PLSRegression
+from sklearn.feature_selection import RFE
 from sklearn.metrics import r2_score, mean_squared_error
 import matplotlib.pyplot as plt
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 import os
 from datetime import datetime
 import pickle
 
 # 导入项目模块
-from plsr_model import PLSRSpectralModel, find_optimal_components_for_element
+from plsr_model import PLSRSpectralModel, GenericSpectralModel, train_element_model
 from spectral_preprocessing import SpectralPreprocessor
 from evaluation_visualization import create_timestamp_directory
 
@@ -66,16 +67,102 @@ def save_results_to_run_folder(results_dict: Dict, timestamp_dir: Optional[str],
             index=False, encoding='utf-8-sig'
         )
 
+def _run_cars_selection(X, y, n_runs=50, n_folds=5, max_components=10, random_state=None):
+    """
+    CARS (Competitive Adaptive Reweighted Sampling) 特征选择算法实现
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+        
+    n_samples, n_features = X.shape
+    
+    # 至少保留2个特征
+    if n_features <= 2:
+        return np.arange(n_features)
+
+    # 参数初始化: r_i = a * exp(-k * i)
+    # r_0 = 1, r_{N-1} = 2/n_features
+    k = np.log(n_features / 2) / (n_runs - 1)
+    a = 1.0 
+    
+    RMSECV_list = []
+    feature_subsets = []
+    
+    # 初始变量集合 (全集)
+    current_vars = np.arange(n_features)
+    
+    from sklearn.model_selection import KFold, cross_val_predict
+    from joblib import parallel_backend
+    
+    for i in range(n_runs):
+        # 1. 蒙特卡洛采样 (MCS) - 随机抽取 80% 样本用于建模计算权重
+        n_train = int(0.8 * n_samples)
+        if n_train < 3: n_train = n_samples
+        
+        rand_idx = np.random.choice(n_samples, n_train, replace=True)
+        X_sub = X[rand_idx][:, current_vars]
+        y_sub = y[rand_idx]
+        
+        # 2. 建立 PLS 模型计算回归系数
+        n_comp = min(max_components, n_train - 2, X_sub.shape[1])
+        if n_comp < 1: n_comp = 1
+        
+        pls = PLSRegression(n_components=n_comp, scale=False)
+        try:
+            pls.fit(X_sub, y_sub)
+        except:
+            break 
+            
+        # 3. 计算权重 (基于回归系数绝对值)
+        coefs = np.abs(pls.coef_).flatten()
+        w = coefs / np.sum(coefs)
+        
+        # 4. 计算保留率 r_i (EDF算法) & 确定保留数量
+        r_i = a * np.exp(-k * i)
+        n_keep = int(np.round(n_features * r_i))
+        if n_keep < 2: n_keep = 2
+        if n_keep > len(current_vars): n_keep = len(current_vars)
+        
+        # 5. 自适应重加权采样 (ARS)
+        w = w / w.sum()
+        keep_indices_local = np.random.choice(len(current_vars), size=n_keep, replace=False, p=w)
+        current_vars = current_vars[keep_indices_local]
+        
+        # 6. 交叉验证评估当前子集
+        X_sel = X[:, current_vars]
+        n_comp_cv = min(max_components, X_sel.shape[1], int(n_samples * 0.8) - 1)
+        if n_comp_cv < 1: n_comp_cv = 1
+        
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        pls_cv = PLSRegression(n_components=n_comp_cv, scale=False)
+        
+        try:
+            with parallel_backend('threading'):
+                y_cv = cross_val_predict(pls_cv, X_sel, y, cv=kf, n_jobs=-1)
+            rmse = np.sqrt(mean_squared_error(y, y_cv))
+        except Exception:
+            rmse = np.inf
+            
+        RMSECV_list.append(rmse)
+        feature_subsets.append(current_vars)
+        
+        if len(current_vars) <= 2: break
+            
+    if not RMSECV_list: return np.arange(n_features)
+        
+    best_idx = np.argmin(RMSECV_list)
+    best_features = feature_subsets[best_idx]
+    print(f"    [CARS] 迭代 {n_runs} 次, 最佳子集包含 {len(best_features)} 个变量 (RMSE={RMSECV_list[best_idx]:.4f})")
+    return best_features
+
 class ElementPredictionPipeline:
-    def __init__(self, spectral_model: Optional[PLSRSpectralModel] = None, parsimony_threshold: float = 0.01, scale: bool = False, selection_method: str = "1-se", max_components: int = 15, f_test_alpha: float = 0.05, wold_r_threshold: float = 0.95, feature_selection_config: Optional[Dict] = None, wavelengths: Optional[np.ndarray] = None):
+    def __init__(self, spectral_model: Optional[Union[PLSRSpectralModel, GenericSpectralModel]] = None, prediction_config: Optional[Dict] = None, feature_selection_config: Optional[Dict] = None, wavelengths: Optional[np.ndarray] = None):
         self.spectral_model = spectral_model
-        self.parsimony_threshold = parsimony_threshold
-        self.scale = scale
-        self.selection_method = selection_method
-        self.max_components = max_components
-        self.f_test_alpha = f_test_alpha
-        self.wold_r_threshold = wold_r_threshold
-        self.feature_selection_config = feature_selection_config if feature_selection_config else {"enabled": False}
+        self.prediction_config = prediction_config if prediction_config else {"method": "PLSR", "params": {}}
+        if isinstance(feature_selection_config, dict):
+            self.feature_selection_config = feature_selection_config
+        else:
+            self.feature_selection_config = {"enabled": False}
         self.wavelengths = wavelengths
         self.element_models = {}
         self.element_names = []
@@ -128,9 +215,24 @@ class ElementPredictionPipeline:
             
             # --- 特征选择 (Feature Selection) ---
             selected_indices = None
-            if self.feature_selection_config.get('enabled', False):
-                method = self.feature_selection_config.get('method', 'pearson')
-                threshold = self.feature_selection_config.get('threshold', 0.1)
+            
+            # Pylance 修复: 使用局部变量并强制类型检查，解决 'bool' object has no attribute 'get'
+            fs_config = self.feature_selection_config
+            if not isinstance(fs_config, dict):
+                fs_config = {"enabled": False}
+
+            if fs_config.get('enabled', False):
+                # 支持直接参数或 params 字典
+                method = fs_config.get('method', 'pearson')
+                
+                # Pylance 修复: 确保 fs_params 是字典，防止 'bool' object has no attribute 'get'
+                _params = fs_config.get('params')
+                if isinstance(_params, dict):
+                    fs_params = _params
+                else:
+                    fs_params = fs_config
+                    
+                threshold = fs_params.get('threshold', 0.1)
                 
                 if method == 'pearson':
                     # 向量化计算皮尔逊相关系数
@@ -161,16 +263,32 @@ class ElementPredictionPipeline:
                     if self.wavelengths is None:
                         print(f"    [Feature Selection] 错误: 选择了 ROI 方法但未提供波长数据。")
                     else:
-                        roi_ranges_config = self.feature_selection_config.get('roi_ranges', {})
+                        roi_ranges_config = fs_config.get('roi_ranges')
                         if not isinstance(roi_ranges_config, dict):
                             roi_ranges_config = {}
+                        
                         # 尝试匹配元素名 (去除空格)
                         ranges = roi_ranges_config.get(element) or roi_ranges_config.get(element.strip())
                         
+                        # 智能匹配氧化物 (e.g. SiO2 -> Si)
+                        if not ranges:
+                            # 按长度降序排列键，防止前缀误判 (e.g. 避免 'C' 匹配 'Ca')
+                            sorted_keys = sorted(roi_ranges_config.keys(), key=len, reverse=True)
+                            for key in sorted_keys:
+                                if element.strip().startswith(key):
+                                    ranges = roi_ranges_config[key]
+                                    print(f"    [Feature Selection] 自动映射: {element} -> {key}")
+                                    break
+
                         if ranges:
                             mask = np.zeros(len(self.wavelengths), dtype=bool)
                             for start_wl, end_wl in ranges:
-                                mask |= (self.wavelengths >= start_wl) & (self.wavelengths <= end_wl)
+                                if abs(start_wl - end_wl) < 1e-6:
+                                    # 单点 ROI: 寻找最近波长
+                                    idx = (np.abs(self.wavelengths - start_wl)).argmin()
+                                    mask[idx] = True
+                                else:
+                                    mask |= (self.wavelengths >= start_wl) & (self.wavelengths <= end_wl)
                             
                             selected_indices = np.where(mask)[0]
                             if len(selected_indices) == 0:
@@ -179,37 +297,69 @@ class ElementPredictionPipeline:
                             else:
                                 X_train_valid = X_train_valid[:, selected_indices]
                                 # print(f"    [Feature Selection] {element} ROI 保留特征: {len(selected_indices)} 点")
+                
+                elif method == 'rfe':
+                    # 递归特征消除 (RFE)
+                    n_features_to_select = fs_params.get('n_features_to_select', None) # None 默认为一半
+                    step = fs_params.get('step', 0.1) # 每次移除 10%
+                    
+                    estimator = PLSRegression(n_components=2)
+                    selector = RFE(estimator, n_features_to_select=n_features_to_select, step=step)
+                    selector = selector.fit(X_train_valid, y_train_valid)
+                    selected_indices = np.where(selector.support_)[0]
+                    print(f"    [Feature Selection] RFE 选中 {len(selected_indices)} 个特征")
+                    X_train_valid = X_train_valid[:, selected_indices]
 
-            # 自动寻优 (限制最大组件数)
-            max_c = min(self.max_components, len(y_train_valid) - 1, X_train_valid.shape[1] - 1)
-            if max_c < 1: max_c = 1
+                elif method == 'cars':
+                    # CARS 算法
+                    selected_indices = _run_cars_selection(X_train_valid, y_train_valid, n_runs=fs_params.get('n_runs', 50), n_folds=fs_params.get('n_folds', 5))
+                    X_train_valid = X_train_valid[:, selected_indices]
+
+            # 动态调整最大组件数 (针对 PLSR)
+            # 注意：这里只是为了防止报错，具体逻辑在 train_element_model 内部也会处理，
+            # 但为了安全起见，我们在这里修改 config 副本
+            current_config = self.prediction_config.copy()
+            params = current_config.get('params', {}).copy()
             
-            opt_n, cv_q2, cv_history = find_optimal_components_for_element(
-                X_train_valid, y_train_valid, 
-                max_components=max_c, 
-                parsimony_threshold=self.parsimony_threshold, 
-                scale=self.scale,
-                timestamp_dir=timestamp_dir,
+            max_c = params.get('max_components', 15)
+            max_c = min(max_c, len(y_train_valid) - 1, X_train_valid.shape[1] - 1)
+            if max_c < 1: max_c = 1
+            params['max_components'] = max_c
+            
+            # 如果传入了特定的 selection_method (覆盖 config)
+            if selection_method:
+                params['selection_method'] = selection_method
+            
+            current_config['params'] = params
+            
+            # 调用通用训练函数
+            model, metrics = train_element_model(
+                X_train_valid, y_train_valid,
+                config=current_config,
                 element_name=f"{mode_name}_{element}",
-                selection_method=selection_method if selection_method else self.selection_method,
-                f_test_alpha=self.f_test_alpha,
-                wold_r_threshold=self.wold_r_threshold
+                timestamp_dir=timestamp_dir
             )
             
-            # 训练模型
-            pls = PLSRegression(n_components=opt_n, scale=self.scale)
-            pls.fit(X_train_valid, y_train_valid)
+            opt_n = metrics.get('n_components', 0)
+            cv_q2 = metrics.get('cv_score', 0)
+            cv_history = metrics.get('cv_history', None)
             
             # 保存
             if models_dir:
                 try:
                     with open(os.path.join(models_dir, f"{element}.pkl"), 'wb') as f:
-                        pickle.dump(pls, f)
+                        pickle.dump(model, f)
                 except Exception as e:
                     print(f"    模型保存失败: {e}")
             
             # 记录训练集指标
-            y_pred_train = pls.predict(X_train_valid).flatten()
+            y_pred_train_raw = model.predict(X_train_valid)
+            # 修复 Pylance 类型检查误报 (PLSRegression 可能被推断为返回 tuple)
+            if isinstance(y_pred_train_raw, tuple):
+                y_pred_train = y_pred_train_raw[0]
+            else:
+                y_pred_train = y_pred_train_raw
+            y_pred_train = np.asarray(y_pred_train).flatten()
             r2_train = r2_score(y_train_valid, y_pred_train)
             rmse_train = np.sqrt(mean_squared_error(y_train_valid, y_pred_train))
             mre_train = np.mean(np.abs(y_pred_train - y_train_valid) / (np.abs(y_train_valid) + 1e-9)) * 100
@@ -224,7 +374,7 @@ class ElementPredictionPipeline:
                 'cv_history': cv_history
             }
 
-            self.element_models[element] = {'model': pls, 'n_components': opt_n, 'selected_features': selected_indices}
+            self.element_models[element] = {'model': model, 'n_components': opt_n, 'selected_features': selected_indices}
             print(f"    - {element:<5}: n={opt_n:<2}, Train R2={r2_train:.4f}, RMSE={rmse_train:.4f}, MRE={mre_train:.2f}%, CV Q2={cv_q2:.4f}")
 
         # 2. 验证集评估

@@ -7,6 +7,16 @@ from scipy.stats import f
 import os
 import pickle
 from typing import Optional
+from joblib import parallel_backend
+
+# 新增算法库
+from sklearn.svm import SVR
+from sklearn.linear_model import ElasticNet, Lasso, Ridge
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import GridSearchCV
 
 class PLSRSpectralModel:
     """PLSR 光谱校准模型"""
@@ -39,6 +49,24 @@ class PLSRSpectralModel:
             self.model = pickle.load(f)
         self.is_fitted = True
         self.n_components = self.model.n_components
+
+class GenericSpectralModel:
+    """通用光谱模型包装器 (适配 SVR, ElasticNet, RF 等)"""
+    def __init__(self, model):
+        self.model = model
+        self.is_fitted = False
+
+    def fit(self, X, y):
+        self.model.fit(X, y)
+        self.is_fitted = True
+
+    def predict(self, X):
+        if not self.is_fitted: raise ValueError("模型未拟合")
+        return self.model.predict(X)
+
+    def save(self, filepath):
+        with open(filepath, 'wb') as f:
+            pickle.dump(self.model, f)
 
 def find_optimal_components(X: np.ndarray, Y: np.ndarray, 
                            max_components: int = 15, 
@@ -77,27 +105,28 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
         # 使用 cross_val_predict 获取所有样本的留一法预测值
         # 这比手动循环更高效且代码更整洁，同时支持并行
         try:
-            y_cv = cross_val_predict(model, X, Y, cv=loo, n_jobs=-1)
+            # 针对 Windows 小样本优化：强制使用 threading 后端避免进程创建(spawn)开销
+            with parallel_backend('threading'):
+                y_cv = cross_val_predict(model, X, Y, cv=loo, n_jobs=-1)
         except Exception as e:
             print(f"      [Warning] CV failed for n={n}: {e}")
             score_list.append(np.inf if task_type == 'prediction' else -1.0)
             continue
 
+        # --- 统一计算 MSE 和 SE (用于高级选择策略) ---
+        mse = mean_squared_error(Y, y_cv)
+        sq_errors = (Y.flatten() - y_cv.flatten()) ** 2
+        se = np.std(sq_errors, ddof=1) / np.sqrt(len(sq_errors))
+        mse_values.append(mse)
+        se_values.append(se)
+
         if task_type == 'prediction':
-            # 1. 元素预测任务 (优化 RMSE)
-            mse = mean_squared_error(Y, y_cv)
+            # 预测任务主要关注 RMSE
             rmse = np.sqrt(mse)
             score_list.append(rmse)
             
-            # 计算 MSE 的标准误 (Standard Error) 用于 1-SE 准则
-            # SE = std(squared_errors) / sqrt(N)
-            sq_errors = (Y.flatten() - y_cv.flatten()) ** 2
-            se = np.std(sq_errors, ddof=1) / np.sqrt(len(sq_errors))
-            mse_values.append(mse)
-            se_values.append(se)
-            
         else: 
-            # 2. 光谱校准任务 (优化相关性)
+            # 校准任务主要关注 Correlation
             # 处理差异学习的重构
             if X_base is not None:
                 y_final_pred = y_cv + X_base
@@ -126,8 +155,11 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
 
     scores = np.array(score_list)
 
-    # --- 优化主成分选择策略 (简约原则) ---
-    if task_type == 'prediction':
+    # --- 优化主成分选择策略 ---
+    # 如果选择了基于 MSE 的策略 (min_mse, 1-se, f_test, wold_r)，则使用通用 MSE 逻辑
+    mse_strategies = ["min_mse", "1-se", "f_test", "wold_r"]
+    
+    if selection_method in mse_strategies:
         # 找到 MSE 最小的点
         best_idx = np.argmin(mse_values)
         min_mse = mse_values[best_idx]
@@ -179,7 +211,8 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
             optimal_idx = best_idx
 
     else:
-        # 策略 B: 相关性任务保持原有的百分比阈值策略
+        # 默认策略 (针对校准任务的 Correlation Parsimony)
+        # 或者当 selection_method 设置为 'parsimony' 时
         best_idx = np.argmax(scores)
         best_score = scores[best_idx]
         optimal_idx = best_idx
@@ -213,7 +246,7 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
         val_score = scores[optimal_idx]
 
     if optimal_idx != best_idx:
-        if task_type == 'prediction':
+        if selection_method in mse_strategies:
             print(f"   [Auto-ML] {selection_method}准则生效: 选择 n={optimal_n} (MSE: {mse_values[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best MSE: {mse_values[best_idx]:.4f}, SE: {se_values[best_idx]:.4f})")
         else:
             print(f"   [Auto-ML] 简约策略生效: 选择 n={optimal_n} (Score: {scores[optimal_idx]:.4f}) 替代 n={components_range[best_idx]} (Best: {best_score:.4f})")
@@ -262,3 +295,171 @@ def find_optimal_components(X: np.ndarray, Y: np.ndarray,
 
 def find_optimal_components_for_element(X, y, max_components=15, parsimony_threshold=0.01, scale=False, timestamp_dir=None, element_name=None, selection_method="1-se", f_test_alpha=0.05, wold_r_threshold=0.95):
     return find_optimal_components(X, y, max_components, task_type='prediction', parsimony_threshold=parsimony_threshold, scale=scale, timestamp_dir=timestamp_dir, element_name=element_name, selection_method=selection_method, f_test_alpha=f_test_alpha, wold_r_threshold=wold_r_threshold)
+
+def _clean_params(params, ignore_keys=None):
+    """清理不属于当前模型的参数"""
+    if ignore_keys is None:
+        ignore_keys = ['max_components', 'parsimony_threshold', 'selection_method', 
+                       'f_test_alpha', 'wold_r_threshold', 'learn_difference']
+    
+    # 复制并移除 PLSR 特有参数
+    clean = params.copy()
+    for k in ignore_keys:
+        clean.pop(k, None)
+    
+    # 单独处理 scale，因为很多模型需要外部 StandardScaler
+    scale = clean.pop('scale', False)
+    return clean, scale
+
+def train_calibration_model(X, Y, config, timestamp_dir=None, X_base=None):
+    """
+    根据配置训练光谱校准模型
+    """
+    method = config.get('method', 'PLSR')
+    params = config.get('params', {})
+    
+    if method.upper() == 'PLSR':
+        max_components = params.get('max_components', 15)
+        scale = params.get('scale', False)
+        parsimony_threshold = params.get('parsimony_threshold', 0.01)
+        selection_method = params.get('selection_method', 'parsimony') # 默认为相关性简约策略
+        f_test_alpha = params.get('f_test_alpha', 0.05)
+        wold_r_threshold = params.get('wold_r_threshold', 0.95)
+        
+        # 自动寻优
+        optimal_n, best_score, history = find_optimal_components(
+            X, Y, 
+            max_components=max_components, 
+            task_type='calibration', 
+            timestamp_dir=timestamp_dir, 
+            parsimony_threshold=parsimony_threshold, 
+            selection_method=selection_method,
+            f_test_alpha=f_test_alpha,
+            wold_r_threshold=wold_r_threshold,
+            scale=scale, 
+            X_base=X_base
+        )
+        
+        model = PLSRSpectralModel(n_components=optimal_n, scale=scale)
+        model.fit(X, Y)
+        
+        return model, {'n_components': optimal_n, 'score': best_score, 'history': history}
+    
+    elif method.upper() == 'SVR':
+        # SVR 光谱校准 (多输出回归)
+        params_clean, use_scale = _clean_params(params)
+        # 默认参数优化
+        if 'kernel' not in params_clean: params_clean['kernel'] = 'rbf'
+        
+        estimator = SVR(**params_clean)
+        if use_scale: estimator = make_pipeline(StandardScaler(), estimator)
+        
+        # 使用 MultiOutputRegressor 包装以支持多波长输出
+        model = MultiOutputRegressor(estimator, n_jobs=-1)
+        model.fit(X, Y)
+        return GenericSpectralModel(model), {'score': 0}
+
+    elif method.upper() == 'ELASTICNET':
+        params_clean, use_scale = _clean_params(params)
+        estimator = ElasticNet(**params_clean)
+        if use_scale: estimator = make_pipeline(StandardScaler(), estimator)
+        
+        model = MultiOutputRegressor(estimator, n_jobs=-1)
+        model.fit(X, Y)
+        return GenericSpectralModel(model), {'score': 0}
+
+    elif method.upper() in ['RF', 'RANDOMFOREST']:
+        params_clean, _ = _clean_params(params) # RF 通常不需要缩放
+        if 'n_estimators' not in params_clean: params_clean['n_estimators'] = 100
+        
+        model = RandomForestRegressor(**params_clean, n_jobs=-1)
+        model.fit(X, Y)
+        return GenericSpectralModel(model), {'score': 0}
+
+    else:
+        raise ValueError(f"不支持的校准方法: {method} (目前仅支持 PLSR)")
+
+def train_element_model(X, y, config, element_name, timestamp_dir=None):
+    """
+    根据配置训练元素预测模型
+    """
+    method = config.get('method', 'PLSR')
+    params = config.get('params', {})
+    
+    if method.upper() == 'PLSR':
+        max_components = params.get('max_components', 15)
+        scale = params.get('scale', False)
+        parsimony_threshold = params.get('parsimony_threshold', 0.01)
+        selection_method = params.get('selection_method', '1-se')
+        f_test_alpha = params.get('f_test_alpha', 0.05)
+        wold_r_threshold = params.get('wold_r_threshold', 0.95)
+        
+        # 自动寻优
+        optimal_n, val_score, history = find_optimal_components_for_element(
+            X, y, 
+            max_components=max_components, 
+            parsimony_threshold=parsimony_threshold, 
+            scale=scale, 
+            timestamp_dir=timestamp_dir, 
+            element_name=element_name, 
+            selection_method=selection_method, 
+            f_test_alpha=f_test_alpha, 
+            wold_r_threshold=wold_r_threshold
+        )
+        
+        model = PLSRegression(n_components=optimal_n, scale=scale)
+        model.fit(X, y)
+        
+        return model, {'n_components': optimal_n, 'cv_score': val_score, 'cv_history': history}
+        
+    elif method.upper() == 'SVR':
+        params_clean, use_scale = _clean_params(params)
+        
+        # 支持简单的网格搜索 (如果参数是列表)
+        grid_params = {k: v for k, v in params_clean.items() if isinstance(v, list)}
+        fixed_params = {k: v for k, v in params_clean.items() if not isinstance(v, list)}
+        
+        estimator = SVR(**fixed_params)
+        if use_scale:
+            estimator = make_pipeline(StandardScaler(), estimator)
+            # 调整 grid 参数的 key
+            grid_params = {f'svr__{k}': v for k, v in grid_params.items()} if grid_params else {}
+
+        if grid_params:
+            print(f"   [Auto-ML] SVR 网格搜索: {grid_params}")
+            model = GridSearchCV(estimator, grid_params, cv=5, n_jobs=-1)
+        else:
+            model = estimator
+            
+        model.fit(X, y)
+        if isinstance(model, GridSearchCV):
+            best_params = model.best_params_
+        else:
+            best_params = fixed_params
+        return model, {'n_components': 0, 'cv_score': 0, 'best_params': best_params}
+
+    elif method.upper() == 'ELASTICNET':
+        params_clean, use_scale = _clean_params(params)
+        estimator = ElasticNet(**params_clean)
+        if use_scale: estimator = make_pipeline(StandardScaler(), estimator)
+        
+        estimator.fit(X, y)
+        return estimator, {'n_components': 0}
+
+    elif method.upper() in ['RF', 'RANDOMFOREST']:
+        params_clean, _ = _clean_params(params)
+        if 'n_estimators' not in params_clean: params_clean['n_estimators'] = 100
+        
+        # 检查是否需要网格搜索
+        grid_params = {k: v for k, v in params_clean.items() if isinstance(v, list)}
+        fixed_params = {k: v for k, v in params_clean.items() if not isinstance(v, list)}
+        
+        model = RandomForestRegressor(**fixed_params, n_jobs=-1)
+        if grid_params:
+             model = GridSearchCV(RandomForestRegressor(n_jobs=-1), grid_params, cv=5, n_jobs=-1)
+             
+        model.fit(X, y)
+        return model, {'n_components': 0}
+
+    else:
+        raise ValueError(f"不支持的预测方法: {method} (目前仅支持 PLSR)")

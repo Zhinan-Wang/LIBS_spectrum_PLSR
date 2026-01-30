@@ -30,30 +30,50 @@
     ]
   },
   "model": {
-    "max_components": 15,
-    "max_components_element": 15,
-    "parsimony_threshold": 0.03,
-    "scale": false,
-    "learn_difference": true,
-    "component_selection_method": "min_mse",
-    "f_test_alpha": 0.05,
-    "wold_r_threshold": 0.98,
+    "calibration": {
+      "method": "PLSR",
+      "params": {
+        "max_components": 15,
+        "scale": false,
+        "learn_difference": true,
+        "parsimony_threshold": 0.03,
+        "selection_method": "min_mse",
+        "f_test_alpha": 0.05,
+        "wold_r_threshold": 0.98
+      }
+    },
+    "prediction": {
+      "method": "PLSR",
+      "params": {
+        "max_components": 15,
+        "scale": false,
+        "parsimony_threshold": 0.03,
+        "selection_method": "min_mse",
+        "f_test_alpha": 0.05,
+        "wold_r_threshold": 0.98
+      }
+    },
     "feature_selection": {
       "enabled": true,
       "method": "pearson", 
-      "threshold": 0.15,
+      "params": {
+        "threshold": 0.45
+      },
       "roi_ranges": {
-        "SiO2": [[288.0, 288.5], [251.0, 252.0]],
-        "Al2O3": [[308.0, 310.0], [396.0, 397.0]],
-        "Fe": [[259.8, 260.0], [274.0, 275.0]],
-        "MgO": [[285.0, 285.5], [279.0, 280.5]]
+        "Mg": [[279.08, 279.08], [279.55, 279.55],[279.8, 279.8], [280.27, 280.27],[285.21, 285.21]],
+        "Al": [[308.21, 308.21], [309.27, 309.27], [394.40, 394.40], [396.15, 396.15]],
+        "Si": [[263.13, 263.13], [288.16, 288.16], [390.55, 390.55]],
+        "Ca": [[315.89, 315.89], [317.93, 317.93], [393.37, 393.37], [422.67, 422.67]],
+        "Ti": [[306.62, 306.62], [307.87, 307.87], [308.80, 308.80], [323.45, 323.45], [323.66, 323.66], [323.90, 323.90], [326.16, 326.16], [332.95, 332.95], [334.94, 334.94], [336.12, 336.12], [337.28, 337.28], [368.52, 368.52]],
+        "Mn": [[403.08, 403.08], [403.31, 403.31], [403.49, 403.49]],
+        "Fe": [[261.19, 261.19], [273.95, 273.95], [274.65, 274.65], [274.93, 274.93], [275.58, 275.58], [293.69, 293.69], [302.10, 302.10], [334.06, 334.06], [358.12, 358.12], [361.88, 361.88], [371.99, 371.99], [438.35, 438.35]]
       }
     },
     "mode_strategies": {
-      "LQ-only": "wold_r",
-      "Calib-Spec": "wold_r",
-      "HQ-only": "wold_r",
-      "Calib-Self": "wold_r"
+      "LQ-only": "min_mse",
+      "Calib-Spec": "min_mse",
+      "HQ-only": "min_mse",
+      "Calib-Self": "min_mse"
     },
     "test_size": 0.2,      
     "random_state": 42,    
@@ -126,7 +146,79 @@
     "akima": "Akima插值 (介于样条和线性之间, 对离群点不敏感)",
     "linear": "线性插值 (简单连接两点, 计算最快)",
     "nearest": "最近邻插值 (阶梯状, 通常不推荐用于光谱)"
+  },
+  "_available_selection_methods": {
+    "min_mse": "最小均方误差 (追求最高精度，适合欠拟合场景)",
+    "1-se": "一倍标准误准则 (简约原则，防止过拟合，适合噪声大数据)",
+    "f_test": "F检验 (统计显著性检验，寻找无显著差异的最简模型)",
+    "wold_r": "Wold's R准则 (基于PRESS比率停止增加主成分)",
+    "parsimony": "相关性简约阈值 (仅用于校准任务，基于相关性提升幅度)"
+  },
+  "_method_templates_for_copy_paste": {
+    "PLSR_Default": {
+      "method": "PLSR",
+      "params": {
+        "max_components": 15,
+        "scale": false,
+        "learn_difference": true,
+        "parsimony_threshold": 0.03,
+        "selection_method": "min_mse"
+      }
+    },
+    "SVR_NonLinear": {
+      "method": "SVR",
+      "params": {
+        "kernel": "rbf",
+        "C": 100,
+        "gamma": "scale",
+        "epsilon": 0.1,
+        "scale": true,
+        "learn_difference": true
+      }
+    },
+    "ElasticNet_Sparse": {
+      "method": "ElasticNet",
+      "params": {
+        "alpha": 0.01,
+        "l1_ratio": 0.5,
+        "scale": true,
+        "learn_difference": true
+      }
+    },
+    "RandomForest_Ensemble": {
+      "method": "RF",
+      "params": {
+        "n_estimators": 200,
+        "max_depth": 20,
+        "learn_difference": true
+      }
+    }
+  },
+  "_feature_selection_templates": {
+    "Pearson_Correlation": {
+      "enabled": true,
+      "method": "pearson",
+      "params": { "threshold": 0.45 }
+    },
+    "RFE_Recursive": {
+      "enabled": true,
+      "method": "rfe",
+      "params": {
+        "n_features_to_select": 100,
+        "step": 0.1
+      }
+    },
+    "CARS_Advanced": {
+      "enabled": true,
+      "method": "cars",
+      "params": {
+        "n_runs": 50,
+        "n_folds": 5
+      }
+    },
+    "ROI_Physics": {
+      "enabled": true,
+      "method": "roi"
+    }
   }
-  
-  
 }
