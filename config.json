@@ -48,17 +48,19 @@
         "max_components": 15,
         "scale": false,
         "parsimony_threshold": 0.03,
-        "selection_method": "min_mse",
+        "selection_method": "wold_r",
         "f_test_alpha": 0.05,
         "wold_r_threshold": 0.98
       }
     },
     "feature_selection": {
       "enabled": true,
-      "method": "pearson", 
+      "method": "rfe",
       "params": {
-        "threshold": 0.45
+        "n_features_to_select": 500,
+        "step": 0.1
       },
+      
       "roi_ranges": {
         "Mg": [[279.08, 279.08], [279.55, 279.55],[279.8, 279.8], [280.27, 280.27],[285.21, 285.21]],
         "Al": [[308.21, 308.21], [309.27, 309.27], [394.40, 394.40], [396.15, 396.15]],
@@ -69,11 +71,27 @@
         "Fe": [[261.19, 261.19], [273.95, 273.95], [274.65, 274.65], [274.93, 274.93], [275.58, 275.58], [293.69, 293.69], [302.10, 302.10], [334.06, 334.06], [358.12, 358.12], [361.88, 361.88], [371.99, 371.99], [438.35, 438.35]]
       }
     },
+    "mode_feature_selection": {
+      "LQ-only": {
+        "enabled": true,
+        "method": "rfe",
+        "params": { "n_features_to_select": 500, "step": 0.1 }
+      },
+      "Calib-Spec": {
+        "enabled": false
+      },
+      "HQ-only": {
+        "enabled": true,
+        "method": "pearson",
+        "params": { "threshold": 0.1 }
+      },
+      "Calib-Self": { "enabled": false }
+    },
     "mode_strategies": {
-      "LQ-only": "min_mse",
-      "Calib-Spec": "min_mse",
-      "HQ-only": "min_mse",
-      "Calib-Self": "min_mse"
+      "LQ-only": "wold_r",
+      "Calib-Spec": "wold_r",
+      "HQ-only": "wold_r",
+      "Calib-Self": "wold_r"
     },
     "test_size": 0.2,      
     "random_state": 42,    
@@ -83,7 +101,89 @@
       "test_samples": [9,13,17,21,25,29,33,37,41,45]
     }
   },
-  "_preprocessing_templates_for_copy_paste": {
+
+  "_method_templates_for_copy_paste": {
+    "PLSR_Default": {
+      "method": "PLSR",
+      "params": {
+        "max_components": 15,
+        "scale": false,
+        "learn_difference": true,
+        "parsimony_threshold": 0.03,
+        "selection_method": "min_mse"
+      }
+    },
+    "SVR_NonLinear": {
+      "method": "SVR",
+      "params": {
+        "kernel": "rbf",
+        "C": 100,
+        "gamma": "scale",
+        "epsilon": 0.1,
+        "scale": true,
+        "learn_difference": true
+      }
+    },
+    "ElasticNet_Sparse": {
+      "method": "ElasticNet",
+      "params": {
+        "alpha": 0.01,
+        "l1_ratio": 0.5,
+        "scale": true,
+        "learn_difference": true
+      }
+    },
+    "RandomForest_Ensemble": {
+      "method": "RF",
+      "params": {
+        "n_estimators": 200,
+        "max_depth": 20,
+        "learn_difference": true
+      }
+    }
+  },
+  "_feature_selection_templates": {
+    "Pearson_Correlation": {
+      "enabled": true,
+      "method": "pearson",
+      "params": { "threshold": 0.45 }
+    },
+    "RFE_Recursive": {
+      "enabled": true,
+      "method": "rfe",
+      "params": {
+        "n_features_to_select": 100,
+        "step": 0.1
+      }
+    },
+    "CARS_Advanced": {
+      "enabled": true,
+      "method": "cars",
+      "params": {
+        "n_runs": 50,
+        "n_folds": 5
+      }
+    },
+    "ROI_Physics": {
+      "enabled": true,
+      "method": "roi"
+    },
+    "GA_Evolutionary": {
+      "enabled": true,
+      "method": "ga",
+      "params": {
+        "n_population": 30,
+        "n_generations": 20,
+        "crossover_prob": 0.8,
+        "mutation_prob": 0.1,
+        "early_stopping_patience": 5,
+        "adaptive_mutation_threshold": 2,
+        "max_mutation_prob": 0.3,
+        "mutation_increase_factor": 0.5
+      }
+    }
+  },
+    "_preprocessing_templates_for_copy_paste": {
     "baseline_correction": {
       "method": "baseline_correction",
       "params": { "degree": 3 },
@@ -153,72 +253,5 @@
     "f_test": "F检验 (统计显著性检验，寻找无显著差异的最简模型)",
     "wold_r": "Wold's R准则 (基于PRESS比率停止增加主成分)",
     "parsimony": "相关性简约阈值 (仅用于校准任务，基于相关性提升幅度)"
-  },
-  "_method_templates_for_copy_paste": {
-    "PLSR_Default": {
-      "method": "PLSR",
-      "params": {
-        "max_components": 15,
-        "scale": false,
-        "learn_difference": true,
-        "parsimony_threshold": 0.03,
-        "selection_method": "min_mse"
-      }
-    },
-    "SVR_NonLinear": {
-      "method": "SVR",
-      "params": {
-        "kernel": "rbf",
-        "C": 100,
-        "gamma": "scale",
-        "epsilon": 0.1,
-        "scale": true,
-        "learn_difference": true
-      }
-    },
-    "ElasticNet_Sparse": {
-      "method": "ElasticNet",
-      "params": {
-        "alpha": 0.01,
-        "l1_ratio": 0.5,
-        "scale": true,
-        "learn_difference": true
-      }
-    },
-    "RandomForest_Ensemble": {
-      "method": "RF",
-      "params": {
-        "n_estimators": 200,
-        "max_depth": 20,
-        "learn_difference": true
-      }
-    }
-  },
-  "_feature_selection_templates": {
-    "Pearson_Correlation": {
-      "enabled": true,
-      "method": "pearson",
-      "params": { "threshold": 0.45 }
-    },
-    "RFE_Recursive": {
-      "enabled": true,
-      "method": "rfe",
-      "params": {
-        "n_features_to_select": 100,
-        "step": 0.1
-      }
-    },
-    "CARS_Advanced": {
-      "enabled": true,
-      "method": "cars",
-      "params": {
-        "n_runs": 50,
-        "n_folds": 5
-      }
-    },
-    "ROI_Physics": {
-      "enabled": true,
-      "method": "roi"
-    }
   }
 }

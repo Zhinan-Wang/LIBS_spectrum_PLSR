@@ -78,6 +78,18 @@ def _resample_worker(spectrum: np.ndarray, lq_wavelengths: np.ndarray,
         # 出错返回全0，避免进程崩溃
         return np.zeros_like(ref_wavelengths)
 
+def _asls_worker(y: np.ndarray, H: sparse.spmatrix, p: float, niter: int) -> np.ndarray:
+    """AsLS 单个样本处理函数"""
+    n_points = len(y)
+    w = np.ones(n_points)
+    z = np.zeros_like(y)
+    for _ in range(niter):
+        W = sparse.diags(w)
+        Z = W + H
+        z = spsolve(Z, w * y)
+        w = p * (y > z) + (1 - p) * (y <= z)
+    return y - z
+
 class SpectralPreprocessor:
     """
     光谱预处理器 (矩阵加速版 - 已修复数值稳定性)
@@ -131,18 +143,14 @@ class SpectralPreprocessor:
         D = sparse.diags(diagonals, offsets=[0, 1, 2], shape=(n_points-2, n_points)) # type: ignore
         H = lam * (D.T @ D)
         
-        w = np.ones(n_points)
-        for i in range(n_samples):
-            y = spectra[i]
-            w[:] = 1.0
-            z = np.zeros_like(y)
-            for _ in range(niter):
-                W = sparse.diags(w)
-                Z = W + H
-                z = spsolve(Z, w * y)
-                w = p * (y > z) + (1 - p) * (y <= z)
-            corrected[i] = y - z
-        return corrected
+        # 并行处理 (使用 threading 后端因为 spsolve 释放 GIL 且 H 矩阵共享)
+        if n_samples > 5:
+            results = Parallel(n_jobs=-1, prefer="threads")(
+                delayed(_asls_worker)(spectra[i], H, p, niter) for i in range(n_samples)
+            )
+            return np.array(results)
+        else:
+            return np.array([_asls_worker(spectra[i], H, p, niter) for i in range(n_samples)])
 
     @handle_shape
     def snv_normalization(self, spectra: np.ndarray) -> np.ndarray:
@@ -291,9 +299,10 @@ def find_overlap_wavelength_range(lq_wavelengths: np.ndarray, hq_wavelengths: np
     mask = (hq_wavelengths >= overlap_min) & (hq_wavelengths <= overlap_max)
     return hq_wavelengths[mask]
 
-def load_spectral_data_from_csv(lq_dir: str, hq_dir: str, sample_ids: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def load_spectral_data_from_csv(lq_dir: str, hq_dir: str, sample_ids: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
     import os
     all_lq, all_hq = [], []
+    valid_ids = []
     
     # 读取第一个样本确定波长
     if not sample_ids:
@@ -318,15 +327,20 @@ def load_spectral_data_from_csv(lq_dir: str, hq_dir: str, sample_ids: List[str])
     for sid in sample_ids:
         # 加载 LQ
         lq_p = os.path.join(lq_dir, f"{sid}.csv")
-        if os.path.exists(lq_p):
-            # 假设LQ只有一列强度
-
-            spec = pd.read_csv(lq_p, header=None).iloc[:, 1].values
-            all_lq.append(spec)
-        
-        # 加载 HQ
         hq_p = os.path.join(hq_dir, f"{sid}.csv")
-        if os.path.exists(hq_p):
+        
+        # 必须同时存在才加载，保证数据对齐
+        if os.path.exists(lq_p) and os.path.exists(hq_p):
+            # 假设LQ只有一列强度
+            # 优化: 使用 usecols 只读取第2列(索引1)，减少内存占用和IO时间
+            try:
+                # usecols=[1] 返回 DataFrame, values 为 2D array, 需要 flatten 转为 1D
+                spec = pd.read_csv(lq_p, header=None, usecols=[1]).values.flatten()
+            except Exception:
+                # 如果读取失败(例如文件结构不同)，回退到读取所有列
+                spec = pd.read_csv(lq_p, header=None).iloc[:, 1].values
+            
+            # 加载 HQ
             df = pd.read_csv(hq_p, header=None)
             wl_full = df.iloc[:, 0].values
             # 截取重叠区
@@ -340,8 +354,11 @@ def load_spectral_data_from_csv(lq_dir: str, hq_dir: str, sample_ids: List[str])
             
             # 转置为 (n_replicates, n_points) 以便后续处理
             all_hq.append(spectra_trimmed.T)
+            valid_ids.append(sid)
+        else:
+            print(f"   [Warning] 样品 {sid} 数据不完整 (LQ: {os.path.exists(lq_p)}, HQ: {os.path.exists(hq_p)}) - 已跳过")
 
-    return np.array(all_lq), np.array(all_hq), lq_wl, overlap_wl
+    return np.array(all_lq), np.array(all_hq), lq_wl, overlap_wl, valid_ids
 
 def resample_to_reference(lq_spectra: np.ndarray, lq_wavelengths: np.ndarray, 
                          ref_wavelengths: np.ndarray, method: str = 'cubic_spline') -> Tuple[np.ndarray, dict]:

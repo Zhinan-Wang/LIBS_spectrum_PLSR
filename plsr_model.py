@@ -50,6 +50,9 @@ class PLSRSpectralModel:
         self.is_fitted = True
         self.n_components = self.model.n_components
 
+    def __repr__(self):
+        return f"PLSRSpectralModel(n_components={self.n_components}, scale={self.scale})"
+
 class GenericSpectralModel:
     """通用光谱模型包装器 (适配 SVR, ElasticNet, RF 等)"""
     def __init__(self, model):
@@ -67,6 +70,9 @@ class GenericSpectralModel:
     def save(self, filepath):
         with open(filepath, 'wb') as f:
             pickle.dump(self.model, f)
+            
+    def __repr__(self):
+        return f"GenericSpectralModel(wrapped={self.model})"
 
 def find_optimal_components(X: np.ndarray, Y: np.ndarray, 
                            max_components: int = 15, 

@@ -67,7 +67,7 @@ def save_results_to_run_folder(results_dict: Dict, timestamp_dir: Optional[str],
             index=False, encoding='utf-8-sig'
         )
 
-def _run_cars_selection(X, y, n_runs=50, n_folds=5, max_components=10, random_state=None):
+def _run_cars_selection(X, y, n_runs=50, n_folds=5, max_components=10, random_state=None, scale=False):
     """
     CARS (Competitive Adaptive Reweighted Sampling) 特征选择算法实现
     """
@@ -107,7 +107,7 @@ def _run_cars_selection(X, y, n_runs=50, n_folds=5, max_components=10, random_st
         n_comp = min(max_components, n_train - 2, X_sub.shape[1])
         if n_comp < 1: n_comp = 1
         
-        pls = PLSRegression(n_components=n_comp, scale=False)
+        pls = PLSRegression(n_components=n_comp, scale=scale)
         try:
             pls.fit(X_sub, y_sub)
         except:
@@ -134,11 +134,11 @@ def _run_cars_selection(X, y, n_runs=50, n_folds=5, max_components=10, random_st
         if n_comp_cv < 1: n_comp_cv = 1
         
         kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
-        pls_cv = PLSRegression(n_components=n_comp_cv, scale=False)
+        pls_cv = PLSRegression(n_components=n_comp_cv, scale=scale)
         
         try:
             with parallel_backend('threading'):
-                y_cv = cross_val_predict(pls_cv, X_sel, y, cv=kf, n_jobs=-1)
+                y_cv = cross_val_predict(pls_cv, X_sel, y, cv=kf, n_jobs=None) # n_jobs=None 让其使用外层的 threading backend
             rmse = np.sqrt(mean_squared_error(y, y_cv))
         except Exception:
             rmse = np.inf
@@ -154,6 +154,126 @@ def _run_cars_selection(X, y, n_runs=50, n_folds=5, max_components=10, random_st
     best_features = feature_subsets[best_idx]
     print(f"    [CARS] 迭代 {n_runs} 次, 最佳子集包含 {len(best_features)} 个变量 (RMSE={RMSECV_list[best_idx]:.4f})")
     return best_features
+
+def _run_ga_selection(X, y, n_population=30, n_generations=20, 
+                      crossover_prob=0.8, mutation_prob=0.05, 
+                      max_components=10, n_folds=5, random_state=None, scale=False,
+                      early_stopping_patience=5, adaptive_mutation_threshold=2,
+                      max_mutation_prob=0.3, mutation_increase_factor=0.5):
+    """
+    遗传算法 (GA) 特征选择 (并行加速版)
+    """
+    if random_state is not None:
+        np.random.seed(random_state)
+    
+    n_samples, n_features = X.shape
+    
+    # 初始化种群: 随机选择约 10% 的特征作为初始状态
+    # 使用 bool 矩阵表示染色体 (True=选中)
+    initial_prob = 0.1
+    population = (np.random.rand(n_population, n_features) < initial_prob)
+    
+    # 确保每个个体至少选一个特征
+    for i in range(n_population):
+        if not np.any(population[i]):
+            population[i, np.random.randint(0, n_features)] = True
+
+    best_fitness = float('inf')
+    best_mask = None
+    
+    from sklearn.model_selection import KFold, cross_val_predict
+    from joblib import Parallel, delayed, parallel_backend
+    
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+    
+    def evaluate_fitness(mask):
+        if not np.any(mask): return float('inf')
+        X_sel = X[:, mask]
+        # 动态调整组件数
+        n_comp = min(max_components, X_sel.shape[1], int(n_samples * 0.8) - 1)
+        if n_comp < 1: n_comp = 1
+        
+        pls = PLSRegression(n_components=n_comp, scale=scale)
+        try:
+            # 使用 threading backend 避免嵌套并行开销
+            with parallel_backend('threading'):
+                y_cv = cross_val_predict(pls, X_sel, y, cv=kf, n_jobs=None)
+            return np.sqrt(mean_squared_error(y, y_cv))
+        except:
+            return float('inf')
+
+    print(f"    [GA] Start: Pop={n_population}, Gens={n_generations}, Feats={n_features}")
+
+    patience_counter = 0
+    current_mutation_prob = mutation_prob
+
+    for gen in range(n_generations):
+        # 1. 计算适应度 (并行)
+        fitness_scores = Parallel(n_jobs=-1, prefer="threads")(
+            delayed(evaluate_fitness)(ind) for ind in population
+        )
+        fitness_scores = np.array(fitness_scores)
+        
+        # 记录最佳
+        min_idx = np.argmin(fitness_scores)
+        current_best_fitness = fitness_scores[min_idx]
+        
+        if current_best_fitness < best_fitness:
+            best_fitness = current_best_fitness
+            best_mask = population[min_idx].copy()
+            print(f"      Gen {gen+1}: Best RMSE = {best_fitness:.4f} (Features: {np.sum(best_mask)})")
+            patience_counter = 0
+            current_mutation_prob = mutation_prob # 发现新高，重置变异率
+        else:
+            patience_counter += 1
+            # 动态调整: 连续无提升时增大变异率 (Adaptive Mutation)
+            # 策略: 连续 N 代无提升后，每多一代变异率增加 factor 倍，上限 max_prob
+            if patience_counter >= adaptive_mutation_threshold:
+                current_mutation_prob = min(max_mutation_prob, mutation_prob * (1 + mutation_increase_factor * patience_counter))
+                print(f"      [GA] Stagnation detected ({patience_counter} gens). Boosting mutation to {current_mutation_prob:.3f}")
+        
+        if patience_counter >= early_stopping_patience:
+            print(f"      [GA] Early stopping at generation {gen+1} (No improvement for {patience_counter} generations)")
+            break
+
+        # 2. 选择 (锦标赛) & 交叉 & 变异
+        next_gen = []
+        # 精英保留: 直接保留上一代最佳
+        next_gen.append(population[min_idx].copy())
+        
+        while len(next_gen) < n_population:
+            # 锦标赛选择父代
+            candidates_idx = np.random.choice(n_population, 3, replace=False)
+            parent1 = population[candidates_idx[np.argmin(fitness_scores[candidates_idx])]]
+            
+            candidates_idx = np.random.choice(n_population, 3, replace=False)
+            parent2 = population[candidates_idx[np.argmin(fitness_scores[candidates_idx])]]
+            
+            # 交叉
+            child = parent1.copy()
+            if np.random.rand() < crossover_prob:
+                pt = np.random.randint(1, n_features)
+                child[pt:] = parent2[pt:]
+            
+            # 变异
+            if np.random.rand() < current_mutation_prob:
+                # 随机翻转 1% 的位
+                n_mut = max(1, int(n_features * 0.01))
+                mut_idx = np.random.choice(n_features, n_mut, replace=False)
+                child[mut_idx] = ~child[mut_idx]
+            
+            # 确保有效性
+            if not np.any(child):
+                child[np.random.randint(0, n_features)] = True
+                
+            next_gen.append(child)
+            
+        population = np.array(next_gen)
+
+    if best_mask is None:
+        return np.arange(n_features)
+        
+    return np.where(best_mask)[0]
 
 class ElementPredictionPipeline:
     def __init__(self, spectral_model: Optional[Union[PLSRSpectralModel, GenericSpectralModel]] = None, prediction_config: Optional[Dict] = None, feature_selection_config: Optional[Dict] = None, wavelengths: Optional[np.ndarray] = None):
@@ -175,7 +295,8 @@ class ElementPredictionPipeline:
                        mode_name: str,
                        timestamp_dir: Optional[str] = None,
                        val_spectra: Optional[np.ndarray] = None,
-                       selection_method: Optional[str] = None) -> Dict:
+                       selection_method: Optional[str] = None,
+                       feature_selection_config: Optional[Dict] = None) -> Dict:
         """核心通用方法"""
         print(f"\n>>> 启动预测流程: [{mode_name}]")
         
@@ -217,7 +338,7 @@ class ElementPredictionPipeline:
             selected_indices = None
             
             # Pylance 修复: 使用局部变量并强制类型检查，解决 'bool' object has no attribute 'get'
-            fs_config = self.feature_selection_config
+            fs_config = feature_selection_config if feature_selection_config is not None else self.feature_selection_config
             if not isinstance(fs_config, dict):
                 fs_config = {"enabled": False}
 
@@ -312,7 +433,26 @@ class ElementPredictionPipeline:
 
                 elif method == 'cars':
                     # CARS 算法
-                    selected_indices = _run_cars_selection(X_train_valid, y_train_valid, n_runs=fs_params.get('n_runs', 50), n_folds=fs_params.get('n_folds', 5))
+                    # 获取主配置中的 scale 参数，确保特征选择与模型训练标准一致
+                    use_scale = self.prediction_config.get('params', {}).get('scale', False)
+                    selected_indices = _run_cars_selection(X_train_valid, y_train_valid, n_runs=fs_params.get('n_runs', 50), n_folds=fs_params.get('n_folds', 5), scale=use_scale)
+                    X_train_valid = X_train_valid[:, selected_indices]
+                
+                elif method == 'ga':
+                    # GA 算法
+                    use_scale = self.prediction_config.get('params', {}).get('scale', False)
+                    selected_indices = _run_ga_selection(
+                        X_train_valid, y_train_valid, 
+                        n_population=fs_params.get('n_population', 30),
+                        n_generations=fs_params.get('n_generations', 20),
+                        crossover_prob=fs_params.get('crossover_prob', 0.8),
+                        mutation_prob=fs_params.get('mutation_prob', 0.1),
+                        scale=use_scale,
+                        early_stopping_patience=fs_params.get('early_stopping_patience', 5),
+                        adaptive_mutation_threshold=fs_params.get('adaptive_mutation_threshold', 2),
+                        max_mutation_prob=fs_params.get('max_mutation_prob', 0.3),
+                        mutation_increase_factor=fs_params.get('mutation_increase_factor', 0.5)
+                    )
                     X_train_valid = X_train_valid[:, selected_indices]
 
             # 动态调整最大组件数 (针对 PLSR)
@@ -388,17 +528,17 @@ class ElementPredictionPipeline:
         )
 
     # 接口保持兼容
-    def train_element_models_with_lq_only(self, lq_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
-        return self._train_generic(lq_spectra, element_data, train_indices, val_indices, "LQ-only", timestamp_dir, selection_method=selection_method)
+    def train_element_models_with_lq_only(self, lq_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None, feature_selection_config=None):
+        return self._train_generic(lq_spectra, element_data, train_indices, val_indices, "LQ-only", timestamp_dir, selection_method=selection_method, feature_selection_config=feature_selection_config)
     
-    def train_element_models_with_hq_only(self, hq_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
-        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "HQ-only", timestamp_dir, selection_method=selection_method)
+    def train_element_models_with_hq_only(self, hq_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None, feature_selection_config=None):
+        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "HQ-only", timestamp_dir, selection_method=selection_method, feature_selection_config=feature_selection_config)
 
-    def train_element_models_with_calibrated_spectra(self, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
-        return self._train_generic(calibrated_spectra, element_data, train_indices, val_indices, "Calib-Spec", timestamp_dir, selection_method=selection_method)
+    def train_element_models_with_calibrated_spectra(self, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None, feature_selection_config=None):
+        return self._train_generic(calibrated_spectra, element_data, train_indices, val_indices, "Calib-Spec", timestamp_dir, selection_method=selection_method, feature_selection_config=feature_selection_config)
 
-    def train_element_models_hq_train_calib_test(self, hq_spectra, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None):
-        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "Calib-Spec(HQ-Train)", timestamp_dir, val_spectra=calibrated_spectra, selection_method=selection_method)
+    def train_element_models_hq_train_calib_test(self, hq_spectra, calibrated_spectra, element_data, train_indices, val_indices, timestamp_dir=None, selection_method=None, feature_selection_config=None):
+        return self._train_generic(hq_spectra, element_data, train_indices, val_indices, "Calib-Spec(HQ-Train)", timestamp_dir, val_spectra=calibrated_spectra, selection_method=selection_method, feature_selection_config=feature_selection_config)
 
     def evaluate_element_prediction_on_validation_set(self, calibrated_spectra, element_data, val_indices, title_prefix="", timestamp_dir=None, train_results=None):
         results = {}

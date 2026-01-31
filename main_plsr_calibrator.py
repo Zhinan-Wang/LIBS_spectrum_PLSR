@@ -202,7 +202,8 @@ def plot_component_counts(res_lq, res_calib, res_hq, timestamp_dir, res_calib_se
 def plot_cv_curves(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self=None):
     """
     生成各模式下各元素的 CV 寻优曲线 (RMSE vs Components)
-    每个模式生成一张大图，包含所有元素的子图
+    1. 生成分面图 (Grid Plot): 每个元素一张子图，显示原始 RMSE 值
+    2. 生成综合图 (Combined Plot): 所有元素归一化后画在同一张图，便于比较趋势
     """
     if not timestamp_dir: return
     
@@ -220,6 +221,7 @@ def plot_cv_curves(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self=None
         elements = sorted([e for e in results.keys() if 'cv_history' in results[e]])
         if not elements: continue
         
+        # --- 1. 原始分面图 (Grid Plot) ---
         n_elems = len(elements)
         cols = 4
         rows = (n_elems + cols - 1) // cols
@@ -256,12 +258,63 @@ def plot_cv_curves(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self=None
         plt.tight_layout()
         plt.suptitle(f"CV Optimization Curves - {mode_name}", y=1.02, fontsize=16)
         safe_name = mode_name.replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
-        plt.savefig(os.path.join(save_dir, f"cv_curves_{safe_name}.png"), bbox_inches='tight')
+        plt.savefig(os.path.join(save_dir, f"cv_curves_grid_{safe_name}.png"), bbox_inches='tight')
         plt.close()
+        
+        # --- 2. 综合对比图 (Combined Plot) ---
+        # 为了在同一坐标轴显示，我们将 RMSE 归一化到 [0, 1] 区间
+        # 这样可以比较不同元素的收敛趋势
+        fig2, ax2 = plt.subplots(figsize=(14, 8), dpi=300)
+        
+        # 使用 Tab20 颜色表以支持更多元素区分 (最多20种颜色循环)
+        cmap = plt.get_cmap('tab20')
+        colors = cmap(np.linspace(0, 1, len(elements)))
+        
+        for idx, elem in enumerate(elements):
+            data = results[elem]
+            hist = data['cv_history']
+            x = np.array(hist['components'])
+            y = np.array(hist['scores'])
+            opt_n = data.get('n_components', 0)
+            
+            # 过滤无效值 (inf/nan)
+            mask = np.isfinite(y)
+            if not np.any(mask): continue
+            
+            x_plot = x[mask]
+            y_plot = y[mask]
+            
+            # 归一化: (y - min) / (max - min)
+            y_min, y_max = np.min(y_plot), np.max(y_plot)
+            if y_max > y_min:
+                y_norm = (y_plot - y_min) / (y_max - y_min)
+            else:
+                y_norm = np.zeros_like(y_plot)
+            
+            # 绘图 (自动颜色循环)
+            ax2.plot(x_plot, y_norm, '.-', alpha=0.7, linewidth=1.5, label=f"{elem} (n={opt_n})", color=colors[idx])
+            
+            # 标记最佳点
+            if opt_n in x_plot:
+                opt_idx = np.where(x_plot == opt_n)[0][0]
+                # 使用对应颜色绘制星号
+                ax2.plot(x_plot[opt_idx], y_norm[opt_idx], '*', color=colors[idx], markersize=12, markeredgecolor='white', markeredgewidth=1, zorder=10)
+
+        ax2.set_xlabel("Number of Components", fontsize=12)
+        ax2.set_ylabel("Normalized CV RMSE (0=Best, 1=Worst)", fontsize=12)
+        ax2.set_title(f"CV Optimization Trends (Normalized) - {mode_name}", fontsize=14, fontweight='bold')
+        # 将图例放在图外，防止遮挡
+        ax2.legend(bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0., fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        plt.savefig(os.path.join(save_dir, f"cv_curves_combined_{safe_name}.png"), bbox_inches='tight')
+        plt.close()
+        
         count += 1
         
     if count > 0:
-        print(f"   [Plot] CV 寻优曲线图已保存至: {save_dir} (共 {count} 张)")
+        print(f"   [Plot] CV 寻优曲线图已保存至: {save_dir} (共 {count} 组)")
     else:
         print(f"   [Plot] ⚠️ 未生成 CV 曲线图 (可能是因为结果中缺少 cv_history 数据)")
 
@@ -303,8 +356,10 @@ def main():
     print(f"   检测到 {len(sample_ids)} 个样品文件")
 
     # 加载原始数据
-    lq_raw, hq_raw, lq_wl_raw, wl_common = load_spectral_data_from_csv(lq_dir, hq_dir, sample_ids)
-    
+    lq_raw, hq_raw, lq_wl_raw, wl_common, valid_ids = load_spectral_data_from_csv(lq_dir, hq_dir, sample_ids)
+    sample_ids = valid_ids # 更新为实际加载成功的样品ID列表
+    print(f"   成功加载 {len(sample_ids)} 对有效数据")
+
     # 使用自动识别的公共波长范围 (无需手动裁剪)
     hq_wl_trim = wl_common
     hq_trim = hq_raw
@@ -515,6 +570,7 @@ def main():
     learn_diff = calib_params.get('learn_difference', False)
     feature_selection_config = config['model'].get('feature_selection', {"enabled": False})
     mode_strategies = config['model'].get('mode_strategies', {})
+    mode_fs_configs = config['model'].get('mode_feature_selection', {})
     
     if learn_diff:
         print("   [Strategy] 启用差异学习 (Difference Learning: HQ - LQ)...")
@@ -568,7 +624,8 @@ def main():
     # 模式1: LQ-only
     print("\n   [Mode 1] LQ-only (基准)")
     strat = mode_strategies.get('LQ-only', None)
-    res_lq = pipeline.train_element_models_with_lq_only(lq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
+    fs_cfg = mode_fs_configs.get('LQ-only', feature_selection_config)
+    res_lq = pipeline.train_element_models_with_lq_only(lq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat, feature_selection_config=fs_cfg)
     
     # 模式2: Calib-Spec
     print("\n   [Mode 2] Calib-Spec (核心: Train on HQ, Test on Calib-LQ)")
@@ -580,17 +637,20 @@ def main():
     else:
         lq_calibrated = calib_model.predict(lq_proc)
         
-    res_calib = pipeline.train_element_models_hq_train_calib_test(hq_proc, lq_calibrated, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
+    fs_cfg = mode_fs_configs.get('Calib-Spec', feature_selection_config)
+    res_calib = pipeline.train_element_models_hq_train_calib_test(hq_proc, lq_calibrated, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat, feature_selection_config=fs_cfg)
     
     # 模式3: HQ-only
     print("\n   [Mode 3] HQ-only (上限)")
     strat = mode_strategies.get('HQ-only', None)
-    res_hq = pipeline.train_element_models_with_hq_only(hq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
+    fs_cfg = mode_fs_configs.get('HQ-only', feature_selection_config)
+    res_hq = pipeline.train_element_models_with_hq_only(hq_proc, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat, feature_selection_config=fs_cfg)
 
     # 模式4: Calib-Self (实用模式)
     print("\n   [Mode 4] Calib-Self (实用: Train on Calib-LQ, Test on Calib-LQ)")
     strat = mode_strategies.get('Calib-Self', None)
-    res_calib_self = pipeline.train_element_models_with_calibrated_spectra(lq_calibrated, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat)
+    fs_cfg = mode_fs_configs.get('Calib-Self', feature_selection_config)
+    res_calib_self = pipeline.train_element_models_with_calibrated_spectra(lq_calibrated, element_data, train_idx, val_idx, timestamp_dir, selection_method=strat, feature_selection_config=fs_cfg)
 
     # 5.1 生成对比图表
     print("\n[Step 5] 生成综合对比分析图...")
@@ -598,18 +658,30 @@ def main():
     plot_component_counts(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self)
     plot_cv_curves(res_lq, res_calib, res_hq, timestamp_dir, res_calib_self)
     
-    common_elements = set(res_lq.keys()) & set(res_calib.keys()) & set(res_hq.keys()) & set(res_calib_self.keys())
+    # 安全计算共同元素 (防止 res_calib_self 为 None)
+    keys_sets = [set(res_lq.keys()), set(res_calib.keys()), set(res_hq.keys())]
+    if res_calib_self:
+        keys_sets.append(set(res_calib_self.keys()))
+    common_elements = set.intersection(*keys_sets)
+    
     for elem in common_elements:
         plot_prediction_scatter_comparison(res_lq, res_calib, res_hq, elem, timestamp_dir, res_calib_self)
 
     # 6. 打印总结
     print("\n[Summary] 关键元素 (SiO2) R² 对比:")
-    elem = 'SiO2 ' # 确保列名匹配
-    if elem in res_lq:
-        print(f"   LQ-only : {res_lq[elem]['r2']:.4f}")
-        print(f"   Calib   : {res_calib[elem]['r2']:.4f} (Mode 2)")
-        print(f"   Calib-S : {res_calib_self[elem]['r2']:.4f} (Mode 4)")
-        print(f"   HQ-only : {res_hq[elem]['r2']:.4f}")
+    # 尝试查找 SiO2 (处理可能的空格或命名差异)
+    sio2_candidates = ['SiO2', 'SiO2 ', 'Si', 'Si ']
+    target_elem = next((e for e in sio2_candidates if e in res_lq), None)
+    
+    if target_elem:
+        print(f"   Element : {target_elem}")
+        print(f"   LQ-only : {res_lq[target_elem]['r2']:.4f}")
+        print(f"   Calib   : {res_calib[target_elem]['r2']:.4f} (Mode 2)")
+        if res_calib_self and target_elem in res_calib_self:
+            print(f"   Calib-S : {res_calib_self[target_elem]['r2']:.4f} (Mode 4)")
+        print(f"   HQ-only : {res_hq[target_elem]['r2']:.4f}")
+    else:
+        print("   (未找到 SiO2 相关元素，跳过展示)")
         
     print(f"\n✅ 完整流程结束！请查看结果文件夹: {timestamp_dir}")
 
